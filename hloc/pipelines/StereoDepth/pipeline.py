@@ -604,13 +604,12 @@ def concatenate_point_clouds(frame_info: dict, poses: dict, output_path: Path,
         voxel_size: Voxel size for downsampling (0 to disable)
     """
     try:
-        from plyfile import PlyData, PlyElement
+        import open3d as o3d
     except ImportError:
-        logger.error("plyfile not installed, skipping point cloud concatenation")
+        logger.error("open3d not installed, skipping point cloud concatenation")
         return
 
-    all_points = []
-    all_colors = []
+    combined_pcd = o3d.geometry.PointCloud()
 
     for img_name, info in tqdm(frame_info.items(), desc="Concatenating PCDs"):
         cloud_path = info["cloud_path"]
@@ -622,72 +621,33 @@ def concatenate_point_clouds(frame_info: dict, poses: dict, output_path: Path,
             logger.warning(f"No pose for {img_name}")
             continue
 
-        # Load point cloud
-        plydata = PlyData.read(str(cloud_path))
-        vertex = plydata['vertex']
+        # Load point cloud using Open3D
+        pcd = o3d.io.read_point_cloud(str(cloud_path))
 
-        # Extract XYZ
-        x = vertex['x']
-        y = vertex['y']
-        z = vertex['z']
-        points = np.column_stack([x, y, z])
-
-        # Extract colors if available
-        has_color = 'red' in vertex.data.dtype.names
-        if has_color:
-            r = vertex['red']
-            g = vertex['green']
-            b = vertex['blue']
-            colors = np.column_stack([r, g, b])
-        else:
-            colors = np.zeros((len(points), 3), dtype=np.uint8)
-
-        # Transform to world frame: P_world = T @ [P_camera; 1]
+        # Transform to world frame
         T = poses[img_name]
-        points_h = np.column_stack([points, np.ones(len(points))])
-        points_world = (T @ points_h.T).T[:, :3]
+        pcd.transform(T)
 
-        all_points.append(points_world)
-        all_colors.append(colors)
+        # Accumulate points
+        combined_pcd += pcd
 
-    if not all_points:
+    if len(combined_pcd.points) == 0:
         logger.error("No point clouds to concatenate")
         return
 
-    # Combine all points
-    combined_points = np.vstack(all_points)
-    combined_colors = np.vstack(all_colors)
+    logger.info(f"Total points before downsampling: {len(combined_pcd.points)}")
 
-    logger.info(f"Total points before downsampling: {len(combined_points)}")
-
-    # Simple voxel downsampling if requested
+    # Voxel downsampling if requested
     if voxel_size > 0:
         logger.info(f"Downsampling with voxel size {voxel_size}m...")
-        # Quantize points to voxel grid
-        voxel_indices = (combined_points / voxel_size).astype(np.int32)
-        # Use unique voxels (keep first point in each voxel)
-        _, unique_idx = np.unique(voxel_indices, axis=0, return_index=True)
-        combined_points = combined_points[unique_idx]
-        combined_colors = combined_colors[unique_idx]
-        logger.info(f"Points after downsampling: {len(combined_points)}")
+        combined_pcd = combined_pcd.voxel_down_sample(voxel_size)
+        logger.info(f"Points after downsampling: {len(combined_pcd.points)}")
 
     # Save as PLY
-    vertex_data = np.zeros(len(combined_points), dtype=[
-        ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
-        ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')
-    ])
-    vertex_data['x'] = combined_points[:, 0]
-    vertex_data['y'] = combined_points[:, 1]
-    vertex_data['z'] = combined_points[:, 2]
-    vertex_data['red'] = combined_colors[:, 0]
-    vertex_data['green'] = combined_colors[:, 1]
-    vertex_data['blue'] = combined_colors[:, 2]
-
-    el = PlyElement.describe(vertex_data, 'vertex')
-    PlyData([el], text=True).write(str(output_path))
+    o3d.io.write_point_cloud(str(output_path), combined_pcd)
 
     logger.info(f"Saved combined point cloud to {output_path} "
-                f"({len(combined_points)} points)")
+                f"({len(combined_pcd.points)} points)")
 
 
 def main():
