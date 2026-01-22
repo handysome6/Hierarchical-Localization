@@ -1,287 +1,401 @@
-# hloc - the hierarchical localization toolbox
+# Stereo Depth Pipeline
 
-This is `hloc`, a modular toolbox for state-of-the-art 6-DoF visual localization. It implements [Hierarchical Localization](https://arxiv.org/abs/1812.03506), leveraging image retrieval and feature matching, and is fast, accurate, and scalable. This codebase combines and makes easily accessible years of research on image matching and Structure-from-Motion.
+A visual odometry pipeline that combines hloc's state-of-the-art feature matching with depth-based pose estimation and GTSAM bundle adjustment for accurate camera trajectory estimation and point cloud concatenation.
 
-With `hloc`, you can:
+## Features
 
-- Reproduce state-of-the-art results on multiple indoor and outdoor visual localization benchmarks
-- Run Structure-from-Motion with SuperPoint+SuperGlue to localize with your own datasets
-- Evaluate your own local features or image retrieval for visual localization
-- Implement new localization pipelines and debug them easily 🔥
-
-<p align="center">
-  <a href="https://arxiv.org/abs/1812.03506"><img src="doc/hloc.png" width="60%"/></a>
-  <br /><em>Hierachical Localization uses both image retrieval and feature matching</em>
-</p>
-
-##
-
-## Quick start ➡️ [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1Eqoz-uLTCGeEWtH95FZyVs2vI-qkTOWr)
-
-Build 3D maps with Structure-from-Motion and localize any Internet image right from your browser! **You can now run `hloc` and COLMAP in Google Colab with GPU for free.** The notebook [`demo.ipynb`](https://colab.research.google.com/drive/1Eqoz-uLTCGeEWtH95FZyVs2vI-qkTOWr) shows how to run SfM and localization in just a few steps. Try it with your own data and let us know!
+- **SuperPoint + LightGlue**: State-of-the-art learned feature extraction and matching
+- **Depth-based PnP**: Uses pre-computed depth maps for accurate 3D-2D pose estimation
+- **Exhaustive Pairing**: Matches all frame pairs for dense constraint graphs (configurable)
+- **GTSAM Bundle Adjustment**: Global pose optimization with relative pose constraints
+- **Point Cloud Concatenation**: Merge individual point clouds using estimated poses
+- **Open3D Integration**: Efficient point cloud I/O and voxel downsampling
 
 ## Installation
 
-`hloc` requires Python >=3.7 and PyTorch >=1.1. Installing the package locally pulls the other dependencies:
+### Basic Installation
 
 ```bash
 git clone --recursive https://github.com/cvg/Hierarchical-Localization/
 cd Hierarchical-Localization/
 python -m pip install -e .
+
+# Pull external feature models
+git submodule update --init --recursive
 ```
 
-All dependencies are listed in `requirements.txt`. **Starting with `hloc-v1.3`, installing COLMAP is not required anymore.** This repository includes external local features as git submodules – don't forget to pull submodules with `git submodule update --init --recursive`.
+### For Bundle Adjustment (GTSAM)
 
-We also provide a Docker image:
+GTSAM requires Python 3.10 or 3.11 (not compatible with Python 3.13+). Create a dedicated conda environment:
+
 ```bash
-docker build -t hloc:latest .
-docker run -it --rm -p 8888:8888 hloc:latest  # for GPU support, add `--runtime=nvidia`
-jupyter notebook --ip 0.0.0.0 --port 8888 --no-browser --allow-root
+# Create environment with Python 3.10
+mamba create -n hloc_stereo python=3.10 -y
+mamba activate hloc_stereo
+
+# Install GTSAM
+mamba install -c conda-forge gtsam -y
+
+# Install hloc and dependencies
+cd Hierarchical-Localization
+pip install -e .
+pip install open3d
+
+# Pull submodules if not done
+git submodule update --init --recursive
 ```
 
-## General pipeline
+### Verify Installation
 
-The toolbox is composed of scripts, which roughly perform the following steps:
-
-1. Extract local features, like [SuperPoint](https://arxiv.org/abs/1712.07629) or [DISK](https://arxiv.org/abs/2006.13566), for all database and query images
-2. Build a reference 3D SfM model
-   1. Find covisible database images, with retrieval or a prior SfM model
-   2. Match these database pairs with [SuperGlue](https://psarlin.com/superglue/) or the faster [LightGlue](https://github.com/cvg/LightGlue)
-   3. Triangulate a new SfM model with COLMAP
-3. Find database images relevant to each query, using retrieval
-4. Match the query images
-5. Run the localization
-6. Visualize and debug
-
-The localization can then be evaluated on [visuallocalization.net](https://www.visuallocalization.net/) for the supported datasets. When 3D Lidar scans are available, such as for the indoor dataset InLoc, step 2. can be skipped.
-
-Strcture of the toolbox:
-
-- `hloc/*.py` : top-level scripts
-- `hloc/extractors/` : interfaces for feature extractors
-- `hloc/matchers/` : interfaces for feature matchers
-- `hloc/pipelines/` : entire pipelines for multiple datasets
-
-`hloc` can be imported as an external package with `import hloc` or called from the command line with:
-```bash
-python -m hloc.name_of_script --arg1 --arg2
-```
-
-## Tasks
-
-We provide step-by-step guides to localize with Aachen, InLoc, and to generate reference poses for your own data using SfM. Just download the datasets and you're reading to go!
-
-### Aachen – outdoor localization
-
-Have a look at [`pipeline_Aachen.ipynb`](https://nbviewer.jupyter.org/github/cvg/Hierarchical-Localization/blob/master/pipeline_Aachen.ipynb) for a step-by-step guide on localizing with Aachen. Play with the visualization, try new local features or matcher, and have fun! Don't like notebooks? You can also run all scripts from the command line.
-
-<p align="center">
-  <a href="https://nbviewer.jupyter.org/github/cvg/Hierarchical-Localization/blob/master/pipeline_Aachen.ipynb"><img src="doc/loc_aachen.svg" width="70%"/></a>
-</p>
-
-### InLoc – indoor localization
-
-The notebook [`pipeline_InLoc.ipynb`](https://nbviewer.jupyter.org/github/cvg/Hierarchical-Localization/blob/master/pipeline_InLoc.ipynb) shows the steps for localizing with InLoc. It's much simpler since a 3D SfM model is not needed.
-
-<p align="center">
-  <a href="https://nbviewer.jupyter.org/github/cvg/Hierarchical-Localization/blob/master/pipeline_InLoc.ipynb"><img src="doc/loc_inloc.svg" width="70%"/></a>
-</p>
-
-### SfM reconstruction from scratch
-
-We show in [`pipeline_SfM.ipynb`](https://nbviewer.jupyter.org/github/cvg/Hierarchical-Localization/blob/master/pipeline_SfM.ipynb) how to run 3D reconstruction for an unordered set of images. This generates reference poses, and a nice sparse 3D model suitable for localization with the same pipeline as Aachen.
-
-## Results
-
-- Supported local feature extractors: [SuperPoint](https://arxiv.org/abs/1712.07629), [DISK](https://arxiv.org/abs/2006.13566), [D2-Net](https://arxiv.org/abs/1905.03561), [SIFT](https://www.cs.ubc.ca/~lowe/papers/ijcv04.pdf), and [R2D2](https://arxiv.org/abs/1906.06195).
-- Supported feature matchers: [SuperGlue](https://arxiv.org/abs/1911.11763), its faster follow-up [LightGlue](https://github.com/cvg/LightGlue), and nearest neighbor search with ratio test, distance test, and/or mutual check. hloc also supports dense matching with [LoFTR](https://github.com/zju3dv/LoFTR).
-- Supported image retrieval: [NetVLAD](https://arxiv.org/abs/1511.07247), [AP-GeM/DIR](https://github.com/naver/deep-image-retrieval), [OpenIBL](https://github.com/yxgeee/OpenIBL), and [MegaLoc](https://github.com/gmberton/MegaLoc).
-
-Using NetVLAD for retrieval, we obtain the following best results:
-
-| Methods                                                      | Aachen day         | Aachen night       | Retrieval      |
-| ------------------------------------------------------------ | ------------------ | ------------------ | -------------- |
-| [SuperPoint + SuperGlue](https://www.visuallocalization.net/details/10931/) | 89.6 / 95.4 / 98.8 | 86.7 / 93.9 / 100  | NetVLAD top 50 |
-| [SuperPoint + NN](https://www.visuallocalization.net/details/10866/) | 85.4 / 93.3 / 97.2 | 75.5 / 86.7 / 92.9 | NetVLAD top 30 |
-| D2Net (SS) + NN                                              | 84.6 / 91.4 / 97.1 | 83.7 / 90.8 / 100  | NetVLAD top 30 |
-
-| Methods                                                      | InLoc DUC1         | InLoc DUC2         | Retrieval      |
-| ------------------------------------------------------------ | ------------------ | ------------------ | -------------- |
-| [SuperPoint + SuperGlue](https://www.visuallocalization.net/details/10936/) | 46.5 / 65.7 / 78.3 | 52.7 / 72.5 / 79.4 | NetVLAD top 40 |
-| [SuperPoint + SuperGlue (temporal)](https://www.visuallocalization.net/details/10937/) | 49.0 / 68.7 / 80.8 | 53.4 / 77.1 / 82.4 | NetVLAD top 40 |
-| [SuperPoint + NN](https://www.visuallocalization.net/details/10896/) | 39.9 / 55.6 / 67.2 | 37.4 / 57.3 / 70.2 | NetVLAD top 20 |
-| D2Net (SS) + NN                                              | 39.9 / 57.6 / 67.2 | 36.6 / 53.4 / 61.8 | NetVLAD top 20 |
-
-Check out [visuallocalization.net/benchmark](https://www.visuallocalization.net/benchmark) for more details and additional baselines.
-
-## Supported datasets
-
-We provide in [`hloc/pipelines/`](./hloc/pipelines) scripts to run the reconstruction and the localization on the following datasets: Aachen Day-Night (v1.0 and v1.1), InLoc, Extended CMU Seasons, RobotCar Seasons, 4Seasons, Cambridge Landmarks, and 7-Scenes. For example, after downloading the dataset [with the instructions given here](./hloc/pipelines/Aachen#installation), we can run the Aachen Day-Night pipeline with SuperPoint+SuperGlue using the command:
-```bash
-python -m hloc.pipelines.Aachen.pipeline [--outputs ./outputs/aachen]
-```
-
-## BibTex Citation
-
-If you report any of the above results in a publication, or use any of the tools provided here, please consider citing both [Hierarchical Localization](https://arxiv.org/abs/1812.03506) and [SuperGlue](https://arxiv.org/abs/1911.11763) papers:
-
-```
-@inproceedings{sarlin2019coarse,
-  title     = {From Coarse to Fine: Robust Hierarchical Localization at Large Scale},
-  author    = {Paul-Edouard Sarlin and
-               Cesar Cadena and
-               Roland Siegwart and
-               Marcin Dymczyk},
-  booktitle = {CVPR},
-  year      = {2019}
-}
-
-@inproceedings{sarlin2020superglue,
-  title     = {{SuperGlue}: Learning Feature Matching with Graph Neural Networks},
-  author    = {Paul-Edouard Sarlin and
-               Daniel DeTone and
-               Tomasz Malisiewicz and
-               Andrew Rabinovich},
-  booktitle = {CVPR},
-  year      = {2020},
-}
-```
-
-## Going further
-
-### Debugging and Visualization
-
-<details>
-<summary>[Click to expand]</summary>
-
-Each localization run generates a pickle log file. For each query, it contains the selected database images, their matches, and information from the pose solver, such as RANSAC inliers. It can thus be parsed to gather statistics and analyze failure modes or difficult scenarios. 
-
-We also provide some visualization tools in [`hloc/visualization.py`](./hloc/visualization.py) to visualize some attributes of the 3D SfM model, such as visibility of the keypoints, their track length, or estimated sparse depth (like below).
-
-<p align="center">
-  <a href="./pipeline_Aachen.ipynb"><img src="doc/depth_aachen.svg" width="60%"/></a>
-</p>
-</details>
-
-### Using your own local features or matcher
-
-<details>
-<summary>[Click to expand]</summary>
-
-If your code is based on PyTorch: simply add a new interface in [`hloc/extractors/`](hloc/extractors/) or [`hloc/matchers/`](hloc/matchers/). It needs to inherit from `hloc.utils.base_model.BaseModel`, take as input a data dictionary, and output a prediction dictionary. Have a look at `hloc/extractors/superpoint.py` for an example. You can additionally define a standard configuration in [`hloc/extract_features.py`](hloc/extract_features.py) or [`hloc/match_features.py`](hloc/match_features.py) - it can then be called directly from the command line.
-
-If your code is based on TensorFlow: you will need to either modify `hloc/extract_features.py` and `hloc/match_features.py`, or export yourself the features and matches to HDF5 files, described below.
-
-In a feature file, each key corresponds to the relative path of an image w.r.t. the dataset root (e.g. `db/1.jpg` for Aachen), and has one dataset per prediction (e.g. `keypoints` and `descriptors`, with shape Nx2 and DxN).
-
-In a match file, each key corresponds to the string `path0.replace('/', '-')+'_'+path1.replace('/', '-')` and has a dataset `matches0` with shape N. It indicates, for each keypoint in the first image, the index of the matching keypoint in the second image, or `-1` if the keypoint is unmatched.
-</details>
-
-### Using your own image retrieval
-
-<details>
-<summary>[Click to expand]</summary>
-
-`hloc` also provides an interface for image retrieval via `hloc/extract_features.py`. As previously, simply add a new interface to [`hloc/extractors/`](hloc/extractors/). Alternatively, you will need to export the global descriptors into an HDF5 file, in which each key corresponds to the relative path of an image w.r.t. the dataset root, and contains a dataset `global_descriptor` with size D. You can then export the images pairs with [`hloc/pairs_from_retrieval.py`](hloc/pairs_from_retrieval.py).
-</details>
-
-### Reconstruction with known camera parameters
-
-<details>
-<summary>[Click to expand]</summary>
-
-If the calibration of the camera is known, for example from an external calibration system, you can tell hloc to use these parameters instead of estimating them from EXIF. The name of the camera models and their parameters are [defined by COLMAP](https://colmap.github.io/cameras.html). Python API:
 ```python
-opts = dict(camera_model='SIMPLE_RADIAL', camera_params=','.join(map(str, (f, cx, cy, k))))
-model = reconstruction.main(..., image_options=opts)
-```
-Command-line interface:
-```bash
-python -m hloc.reconstruction [...] --image_options camera_model='"SIMPLE_RADIAL"' camera_params='"256,256,256,0"'
+from hloc.pipelines.StereoDepth.pipeline import GTSAM_AVAILABLE
+print(f"GTSAM available: {GTSAM_AVAILABLE}")
 ```
 
-By default, hloc refines the camera parameters during the reconstruction process. To prevent this, add:
+## Dataset Format
+
+Organize your data with timestamp-named folders:
+
+```
+data_dir/
+├── 1705123456/              # Timestamp folder (numeric name)
+│   ├── rect_left.jpg        # Rectified left image
+│   ├── rect_right.jpg       # Rectified right image (optional)
+│   ├── depth_meter.npy      # Depth map in meters (H x W, float32)
+│   ├── cloud.ply            # Point cloud for concatenation
+│   └── K.txt                # Camera intrinsics
+├── 1705123457/
+│   ├── rect_left.jpg
+│   ├── depth_meter.npy
+│   ├── cloud.ply
+│   └── K.txt
+└── ...
+```
+
+### K.txt Format
+
+```
+fx 0 cx 0 fy cy 0 0 1
+baseline
+```
+
+Example:
+```
+2247.5 0 2063.5 0 2247.5 1505.5 0 0 1
+0.12
+```
+
+- Line 1: 9 values representing the 3x3 intrinsic matrix in row-major order
+- Line 2: Stereo baseline in meters (used for reference, not in pose estimation)
+
+### Depth Map Format
+
+- NumPy array saved as `.npy` file
+- Shape: (H, W) matching the image dimensions
+- Values: Depth in meters (float32)
+- Invalid depth: Use 0 or negative values
+
+## Usage
+
+### Command Line Interface
+
+Basic usage:
+```bash
+python -m hloc.pipelines.StereoDepth.pipeline \
+    --data_dir /path/to/your/data \
+    --output_dir /path/to/output
+```
+
+With Bundle Adjustment:
+```bash
+python -m hloc.pipelines.StereoDepth.pipeline \
+    --data_dir /path/to/your/data \
+    --output_dir /path/to/output \
+    --ba \
+    --voxel_size 0.01
+```
+
+Full options:
+```bash
+python -m hloc.pipelines.StereoDepth.pipeline \
+    --data_dir /path/to/your/data \
+    --output_dir /path/to/output \
+    --ba \                        # Enable Bundle Adjustment
+    --voxel_size 0.01 \           # Point cloud downsampling (meters)
+    --sequential_pairs \          # Use sequential pairing only (faster)
+    --max_exhaustive 50 \         # Max frames for exhaustive pairing
+    --no_pcd \                    # Skip point cloud concatenation
+    --verbose                     # Enable debug logging
+```
+
+### Python API
+
 ```python
-reconstruction.main(..., mapper_options=dict(ba_refine_focal_length=False, ba_refine_extra_params=False))
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'  # Required on Windows
+
+from pathlib import Path
+from hloc.pipelines.StereoDepth.pipeline import run_pipeline
+
+results = run_pipeline(
+    data_dir=Path("/path/to/your/data"),
+    output_dir=Path("/path/to/output"),
+    concatenate_pcd=True,
+    voxel_size=0.01,
+    run_ba=True,
+    exhaustive_pairs=True,
+    max_exhaustive_frames=50,
+)
+
+print(f"Successful poses: {results['num_successful']}/{results['num_frames']-1}")
+print(f"Poses: {results['poses']}")
 ```
+
+### Windows Note
+
+On Windows, you may encounter OpenMP library conflicts. Set this environment variable before running:
+
+```python
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+```
+
+Or in the command line:
+```cmd
+set KMP_DUPLICATE_LIB_OK=TRUE
+python -m hloc.pipelines.StereoDepth.pipeline ...
+```
+
+## Configuration Options
+
+### run_pipeline() Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `data_dir` | Path | required | Directory containing timestamp folders |
+| `output_dir` | Path | required | Output directory for results |
+| `visualize` | bool | False | Show visualizations (not implemented) |
+| `concatenate_pcd` | bool | True | Concatenate point clouds |
+| `voxel_size` | float | 0.01 | Voxel size for downsampling (meters, 0 to disable) |
+| `run_ba` | bool | False | Run Bundle Adjustment with GTSAM |
+| `exhaustive_pairs` | bool | True | Use exhaustive pairing for BA |
+| `max_exhaustive_frames` | int | 50 | Fall back to sequential if more frames |
+
+### Feature Extraction Config
+
+Default SuperPoint configuration (can be modified in `pipeline.py`):
+
+```python
+EXTRACT_CONF = {
+    "output": "feats-superpoint-n4096-r1600",
+    "model": {
+        "name": "superpoint",
+        "nms_radius": 3,
+        "max_keypoints": 4096,
+    },
+    "preprocessing": {
+        "grayscale": True,
+        "resize_max": 1600,
+    },
+}
+```
+
+### Matching Config
+
+Default LightGlue configuration:
+
+```python
+MATCH_CONF = {
+    "output": "matches-lightglue",
+    "model": {
+        "name": "lightglue",
+        "features": "superpoint",
+    },
+}
+```
+
+## Output Files
+
+The pipeline generates the following files in `output_dir`:
+
+```
+output_dir/
+├── images/                  # Symlinked/copied input images
+├── features.h5              # Extracted SuperPoint features
+├── pairs.txt                # Image pairs for matching
+├── matches.h5               # LightGlue matches
+├── poses.txt                # Estimated camera poses (4x4 matrices)
+├── pose_results.json        # Detailed results per frame pair
+└── combined.ply             # Concatenated point cloud (if enabled)
+```
+
+### poses.txt Format
+
+```
+# image_name.jpg
+T00 T01 T02 T03
+T10 T11 T12 T13
+T20 T21 T22 T23
+T30 T31 T32 T33
+```
+
+Each pose is a 4x4 transformation matrix (world_T_camera) that transforms points from camera frame to world frame.
+
+### pose_results.json Format
+
+```json
+[
+  {
+    "frame0": "1705123456.jpg",
+    "frame1": "1705123457.jpg",
+    "success": true,
+    "num_matches": 1523,
+    "num_depth_valid": 1234,
+    "num_inliers": 892,
+    "translation": 0.156
+  },
+  ...
+]
+```
+
+## Pipeline Steps
+
+1. **Image Preparation**: Copy images to output directory with standardized names
+2. **Feature Extraction**: Extract SuperPoint features for all images
+3. **Pair Generation**: Create exhaustive or sequential image pairs
+4. **Feature Matching**: Match features using LightGlue
+5. **Sequential PnP**: Estimate initial poses using depth-based PnP
+6. **BA Observations**: Collect observations from all matched pairs
+7. **Bundle Adjustment**: Optimize poses with GTSAM (optional)
+8. **Point Cloud Concatenation**: Merge clouds using optimized poses (optional)
+
+## Pairing Strategies
+
+### Sequential Pairing (--sequential_pairs)
+- Matches consecutive frames only: (0,1), (1,2), (2,3), ...
+- **Pairs**: n-1 for n frames
+- **Pros**: Fast, minimal computation
+- **Cons**: No loop closure, drift accumulates
+
+### Exhaustive Pairing (default)
+- Matches all frame combinations: (0,1), (0,2), ..., (n-2,n-1)
+- **Pairs**: n(n-1)/2 for n frames
+- **Pros**: Dense constraints, automatic loop closure, reduced drift
+- **Cons**: O(n²) complexity, slower for large datasets
+
+| Frames | Sequential Pairs | Exhaustive Pairs |
+|--------|------------------|------------------|
+| 6 | 5 | 15 |
+| 12 | 11 | 66 |
+| 20 | 19 | 190 |
+| 50 | 49 | 1225 |
+
+## Examples
+
+### Example 1: Quick Run (No BA)
+
 ```bash
-python -m hloc.reconstruction [...] --mapper_options ba_refine_focal_length=False ba_refine_extra_params=False
+python -m hloc.pipelines.StereoDepth.pipeline \
+    --data_dir ./my_data \
+    --sequential_pairs
 ```
 
-</details>
+### Example 2: Full Pipeline with BA
 
-## Versions
+```bash
+python -m hloc.pipelines.StereoDepth.pipeline \
+    --data_dir ./my_data \
+    --output_dir ./output \
+    --ba \
+    --voxel_size 0.005 \
+    --verbose
+```
 
-<details>
-<summary>v1.4 (July 2023)</summary>
+### Example 3: Python Script
 
-- New front ends
-  - global features: OpenIBL (https://github.com/cvg/Hierarchical-Localization/pull/164), CosPlace (https://github.com/cvg/Hierarchical-Localization/pull/257)
-  - patch descriptors: SOSNet (https://github.com/cvg/Hierarchical-Localization/pull/161), HardNet (https://github.com/cvg/Hierarchical-Localization/pull/235)
-  - detector & descriptor: DISK (https://github.com/cvg/Hierarchical-Localization/pull/233, https://github.com/cvg/Hierarchical-Localization/pull/291)
-  - sparse matching: AdaLAM (https://github.com/cvg/Hierarchical-Localization/pull/229), LightGlue (https://github.com/cvg/Hierarchical-Localization/pull/285)
-  - dense matching: LoFTR (https://github.com/cvg/Hierarchical-Localization/pull/173, https://github.com/cvg/Hierarchical-Localization/pull/243, https://github.com/cvg/Hierarchical-Localization/pull/254)
-- Triangulation: use known camera poses for two-view geometric verification (https://github.com/cvg/Hierarchical-Localization/pull/178)
-- Control over COLMAP import and reconstruction options (https://github.com/cvg/Hierarchical-Localization/pull/210)
-- Performance
-  - More reliably skip existing pairs in a match file (https://github.com/cvg/Hierarchical-Localization/pull/159)
-  - Faster HDF5 write (https://github.com/cvg/Hierarchical-Localization/pull/194)
-  - Parallel reading and writing in match_features (https://github.com/cvg/Hierarchical-Localization/pull/242)
-- Add scalar detection uncertainty for LaMAR (https://github.com/cvg/Hierarchical-Localization/pull/158)
-- Documentation (https://github.com/cvg/Hierarchical-Localization/pull/294)
-- Updated requirements: tqdm>=4.36.0, pycolmap>=0.3.0, kornia>=0.6.11
+```python
+#!/usr/bin/env python
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-</details>
+from pathlib import Path
+from hloc.pipelines.StereoDepth.pipeline import run_pipeline, GTSAM_AVAILABLE
 
-<details>
-<summary>v1.3 (January 2022)</summary>
+print(f"GTSAM available: {GTSAM_AVAILABLE}")
 
-- Demo notebook in Google Colab
-- Use the new pycolmap Reconstruction objects and pipeline API
-  - Do not require an installation of COLMAP anymore - pycolmap is enough
-  - Faster model reading and writing
-  - Fine-grained control over camera sharing via the `camera_mode` parameter
-  - Localization with unknown or inaccurate focal length
-- Modular localization API with control over all estimator parameters
-- 3D visualizations or camera frustums and points with plotly
-- Package-specific logging in the hloc namespace
-- Store the extracted features by default as fp16 instead of fp32
-- Optionally fix a long-standing bug in SuperPoint descriptor sampling
-- Add script to compute exhaustive pairs for reconstruction or localization
-- Require pycolmap>=0.1.0 and Python>=3.7
-</details>
+results = run_pipeline(
+    data_dir=Path("C:/data/office_scan"),
+    output_dir=Path("C:/data/office_scan/hloc_output"),
+    concatenate_pcd=True,
+    voxel_size=0.01,
+    run_ba=GTSAM_AVAILABLE,
+    exhaustive_pairs=True,
+)
 
-<details>
-<summary>v1.2 (December 2021)</summary>
+print(f"Results: {results['num_successful']}/{results['num_frames']-1} successful")
 
-- Bug fixes and usability improvements.
-- Support PIL backend for image resizing.
-- Add `__version__` attribute to check against future releases.
-</details>
+# Access poses
+for img_name, pose in results['poses'].items():
+    print(f"{img_name}: t = {pose[:3, 3]}")
+```
 
-<details>
-<summary>v1.1 (July 2021)</summary>
+## Troubleshooting
 
-- **Breaking**: improved structure of the SfM folders (triangulation and reconstruction), see [#76](https://github.com/cvg/Hierarchical-Localization/pull/76)
-- Support for image retrieval (NetVLAD, DIR) and more local features (SIFT, R2D2)
-- Support for more datasets: Aachen v1.1, Extended CMU Seasons, RobotCar Seasons, Cambridge Landmarks, 7-Scenes
-- Simplified pipeline and API
-- Spatial matcher
-</details>
+### "GTSAM not available"
+- GTSAM requires Python 3.10 or 3.11
+- Install via conda: `mamba install -c conda-forge gtsam`
 
-<details>
-<summary>v1.0 (July 2020)</summary>
+### "OpenMP library conflict" (Windows)
+```python
+import os
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+```
 
-Initial public version.
-</details>
+### "Too few matches" or "PnP failed"
+- Check image quality and overlap between consecutive frames
+- Ensure depth maps are valid (positive values in meters)
+- Try increasing `max_keypoints` in EXTRACT_CONF
 
-## Contributions welcome!
+### "Low inlier ratio"
+- Images may have large viewpoint changes
+- Try capturing with smaller motion between frames
+- The pipeline uses 8.0 pixel reprojection threshold for high-res images
 
-External contributions are very much welcome. Please follow the [PEP8 style guidelines](https://www.python.org/dev/peps/pep-0008/) using a linter like flake8. This is a non-exhaustive list of features that might be valuable additions:
+### Memory issues with large datasets
+- Use `--sequential_pairs` to reduce matching pairs
+- Reduce `max_keypoints` in configuration
+- Process in batches if necessary
 
-- [ ] support for GPS (extraction from EXIF + guided retrieval)
-- [ ] covisibility clustering for InLoc
-- [ ] visualization of the raw predictions (features and matches)
-- [ ] other local features or image retrieval
+## Technical Details
 
-Created and maintained by [Paul-Edouard Sarlin](https://psarlin.com/) with the help of many contributors.
+### Coordinate Conventions
+
+- **Pose Convention**: `poses[img]` is `T_world_camera` (transforms camera points to world)
+- **Depth Convention**: Depth values in meters along the camera Z-axis
+- **Point Cloud**: Points in camera coordinate frame before transformation
+
+### PnP Estimation
+
+- Uses OpenCV's `solvePnPRansac` with P3P method
+- Reprojection error threshold: 8.0 pixels (suitable for high-res images)
+- Minimum inliers: 6 points
+- Inlier ratio threshold: 15%
+
+### Bundle Adjustment
+
+- Uses GTSAM's `BetweenFactorPose3` for relative pose constraints
+- Noise model scales inversely with number of inliers
+- First pose is fixed with tight prior
+- Levenberg-Marquardt optimizer with 100 max iterations
+
+## License
+
+This pipeline is part of the hloc toolbox. See LICENSE file for details.
+
+## Acknowledgments
+
+- [hloc](https://github.com/cvg/Hierarchical-Localization) - Hierarchical Localization toolbox
+- [SuperPoint](https://arxiv.org/abs/1712.07629) - Self-supervised interest point detection
+- [LightGlue](https://github.com/cvg/LightGlue) - Fast feature matching
+- [GTSAM](https://gtsam.org/) - Georgia Tech Smoothing and Mapping library
+- [Open3D](http://www.open3d.org/) - 3D data processing library
