@@ -353,7 +353,9 @@ def run_pipeline(data_dir: Path, output_dir: Path,
                  visualize: bool = False,
                  concatenate_pcd: bool = True,
                  voxel_size: float = 0.01,
-                 run_ba: bool = False) -> dict:
+                 run_ba: bool = False,
+                 exhaustive_pairs: bool = True,
+                 max_exhaustive_frames: int = 50) -> dict:
     """Run the stereo depth pipeline.
 
     Args:
@@ -363,6 +365,8 @@ def run_pipeline(data_dir: Path, output_dir: Path,
         concatenate_pcd: Whether to concatenate point clouds
         voxel_size: Voxel size for point cloud downsampling
         run_ba: Whether to run Bundle Adjustment
+        exhaustive_pairs: Use exhaustive pairing for better BA constraints
+        max_exhaustive_frames: Max frames for exhaustive pairing (falls back to sequential)
 
     Returns:
         results: Dictionary with poses and statistics
@@ -427,13 +431,25 @@ def run_pipeline(data_dir: Path, output_dir: Path,
         feature_path=features_path,
     )
 
-    # Step 3: Create pairs (sequential pairs for VO)
+    # Step 3: Create pairs
     pairs_path = output_dir / "pairs.txt"
-    with open(pairs_path, 'w') as f:
-        for i in range(len(image_list) - 1):
-            f.write(f"{image_list[i]} {image_list[i+1]}\n")
+    use_exhaustive = exhaustive_pairs and len(image_list) <= max_exhaustive_frames
 
-    logger.info(f"Created {len(image_list) - 1} sequential pairs")
+    if use_exhaustive:
+        # Exhaustive pairing: all combinations for dense BA constraints
+        num_pairs = 0
+        with open(pairs_path, 'w') as f:
+            for i in range(len(image_list)):
+                for j in range(i + 1, len(image_list)):
+                    f.write(f"{image_list[i]} {image_list[j]}\n")
+                    num_pairs += 1
+        logger.info(f"Created {num_pairs} exhaustive pairs (all combinations)")
+    else:
+        # Sequential pairing: fallback for large datasets
+        with open(pairs_path, 'w') as f:
+            for i in range(len(image_list) - 1):
+                f.write(f"{image_list[i]} {image_list[i+1]}\n")
+        logger.info(f"Created {len(image_list) - 1} sequential pairs")
 
     # Step 4: Match features using hloc
     matches_path = output_dir / "matches.h5"
@@ -463,69 +479,56 @@ def run_pipeline(data_dir: Path, output_dir: Path,
     # Store K matrix for BA
     sample_K = frame_info[image_list[0]]["K"]
 
-    for i in tqdm(range(len(image_list) - 1), desc="PnP"):
-        img0, img1 = image_list[i], image_list[i + 1]
-
-        # Get keypoints (get_keypoints takes path and image name)
+    # Helper function to process a pair and get observations
+    def process_pair(img0, img1):
+        """Process a pair and return (pts_3d, pts_2d, inliers, R, t, success, reason)."""
         kpts0 = get_keypoints(features_path, img0)
         kpts1 = get_keypoints(features_path, img1)
 
-        # Get matches (returns (matches, scores) where matches is Nx2 array)
         try:
             matches, scores = get_matches(matches_path, img0, img1)
-        except ValueError as e:
-            logger.warning(f"No matches found between {img0} and {img1}: {e}")
-            poses[img1] = T_world.copy()
-            pose_results.append({
-                "frame0": img0, "frame1": img1,
-                "success": False, "reason": "no_matches"
-            })
-            continue
+        except ValueError:
+            return None, None, None, None, None, False, "no_matches", 0
 
         num_matches = len(matches)
         if num_matches < 10:
-            logger.warning(f"Too few matches between {img0} and {img1}: {num_matches}")
-            poses[img1] = T_world.copy()
-            pose_results.append({
-                "frame0": img0, "frame1": img1,
-                "success": False, "reason": "too_few_matches"
-            })
-            continue
+            return None, None, None, None, None, False, "too_few_matches", num_matches
 
-        # matches is Nx2 array: matches[i] = [idx0, idx1]
         matched_kpts0 = kpts0[matches[:, 0]]
         matched_kpts1 = kpts1[matches[:, 1]]
 
-        # Load depth for frame 0
         info0 = frame_info[img0]
         depth0 = load_depth_map(info0["depth_path"])
         K = info0["K"]
 
-        # Get 3D points from depth (keypoints are already in original image coordinates)
         pts_3d, depth_valid = get_3d_from_depth(matched_kpts0, depth0, K)
 
         if depth_valid.sum() < 10:
-            logger.warning(f"Too few valid depth points: {depth_valid.sum()}")
-            poses[img1] = T_world.copy()
-            pose_results.append({
-                "frame0": img0, "frame1": img1,
-                "success": False, "reason": "too_few_depth"
-            })
-            continue
+            return None, None, None, None, None, False, "too_few_depth", num_matches
 
-        # Filter to only points with valid depth
         pts_3d_valid = pts_3d[depth_valid]
-        pts_2d_valid = matched_kpts1[depth_valid]  # Already in original coords
+        pts_2d_valid = matched_kpts1[depth_valid]
 
-        # PnP pose estimation
         R, t, inliers, success = estimate_pose_pnp(pts_3d_valid, pts_2d_valid, K)
 
         if not success:
-            logger.warning(f"PnP failed for {img0} -> {img1}")
+            return pts_3d_valid, pts_2d_valid, None, None, None, False, "pnp_failed", num_matches
+
+        return pts_3d_valid, pts_2d_valid, inliers, R, t, True, None, num_matches
+
+    # Step 5a: Sequential PnP for initial pose estimates
+    logger.info("Computing initial poses from sequential pairs...")
+    for i in tqdm(range(len(image_list) - 1), desc="Sequential PnP"):
+        img0, img1 = image_list[i], image_list[i + 1]
+
+        pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = process_pair(img0, img1)
+
+        if not success:
+            logger.warning(f"Sequential PnP failed for {img0} -> {img1}: {reason}")
             poses[img1] = T_world.copy()
             pose_results.append({
                 "frame0": img0, "frame1": img1,
-                "success": False, "reason": "pnp_failed"
+                "success": False, "reason": reason
             })
             continue
 
@@ -535,7 +538,6 @@ def run_pipeline(data_dir: Path, output_dir: Path,
         T_rel[:3, 3] = t
 
         # Accumulate pose: T_world_new = T_world @ inv(T_rel)
-        # Because T_rel transforms points from frame0 to frame1
         T_world = T_world @ np.linalg.inv(T_rel)
         poses[img1] = T_world.copy()
 
@@ -543,23 +545,55 @@ def run_pipeline(data_dir: Path, output_dir: Path,
             "frame0": img0, "frame1": img1,
             "success": True,
             "num_matches": num_matches,
-            "num_depth_valid": int(depth_valid.sum()),
-            "num_inliers": int(len(inliers)),
+            "num_depth_valid": len(pts_3d),
+            "num_inliers": len(inliers),
             "translation": np.linalg.norm(t),
         })
 
-        # Collect observation for BA
-        ba_observations.append({
-            "frame0": img0,
-            "frame1": img1,
-            "pts_3d": pts_3d_valid,
-            "pts_2d": pts_2d_valid,
-            "inliers": inliers,
-        })
-
         logger.debug(f"{img0} -> {img1}: matches={num_matches}, "
-                    f"depth_valid={depth_valid.sum()}, inliers={len(inliers)}, "
+                    f"depth_valid={len(pts_3d)}, inliers={len(inliers)}, "
                     f"t={np.linalg.norm(t):.3f}m")
+
+    # Step 5b: Collect BA observations from ALL pairs (exhaustive)
+    if use_exhaustive and run_ba:
+        logger.info("Collecting BA observations from all pairs...")
+        all_pairs = [(image_list[i], image_list[j])
+                     for i in range(len(image_list))
+                     for j in range(i + 1, len(image_list))]
+
+        for img0, img1 in tqdm(all_pairs, desc="BA observations"):
+            # Skip if either frame doesn't have a pose
+            if img0 not in poses or img1 not in poses:
+                continue
+
+            pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = process_pair(img0, img1)
+
+            if success and inliers is not None:
+                ba_observations.append({
+                    "frame0": img0,
+                    "frame1": img1,
+                    "pts_3d": pts_3d,
+                    "pts_2d": pts_2d,
+                    "inliers": inliers,
+                })
+        logger.info(f"Collected {len(ba_observations)} BA observation pairs")
+    else:
+        # Use sequential observations only
+        for i in range(len(image_list) - 1):
+            img0, img1 = image_list[i], image_list[i + 1]
+            if img0 not in poses or img1 not in poses:
+                continue
+
+            pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = process_pair(img0, img1)
+
+            if success and inliers is not None:
+                ba_observations.append({
+                    "frame0": img0,
+                    "frame1": img1,
+                    "pts_3d": pts_3d,
+                    "pts_2d": pts_2d,
+                    "inliers": inliers,
+                })
 
     # Step 5.5: Bundle Adjustment (optional)
     if run_ba and GTSAM_AVAILABLE and len(ba_observations) > 0:
@@ -675,6 +709,14 @@ def main():
         help="Run Bundle Adjustment using GTSAM"
     )
     parser.add_argument(
+        "--sequential_pairs", action="store_true",
+        help="Use sequential pairing only (default: exhaustive for small datasets)"
+    )
+    parser.add_argument(
+        "--max_exhaustive", type=int, default=50,
+        help="Max frames for exhaustive pairing (default: 50)"
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable verbose logging"
     )
@@ -696,6 +738,8 @@ def main():
         concatenate_pcd=not args.no_pcd,
         voxel_size=args.voxel_size,
         run_ba=args.ba,
+        exhaustive_pairs=not args.sequential_pairs,
+        max_exhaustive_frames=args.max_exhaustive,
     )
 
     logger.info(f"Pipeline complete: {results['num_successful']}/{results['num_frames']-1} "

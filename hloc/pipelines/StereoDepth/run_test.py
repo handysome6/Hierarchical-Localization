@@ -17,6 +17,7 @@ results = run_pipeline(
     concatenate_pcd=True,
     voxel_size=0.01,
     run_ba=True,
+    exhaustive_pairs=True,  # Use all pairs for dense BA constraints
 )
 
 print(f"Pipeline complete: {results['num_successful']}/{results['num_frames']-1} successful")
