@@ -1,11 +1,11 @@
 """
-Stereo Depth Pipeline: hloc feature matching + depth-based PnP
+Stereo Depth Pipeline: hloc feature matching + depth-based PnP + GTSAM BA
 
 This pipeline uses:
 1. hloc for feature extraction (SuperPoint) and matching (LightGlue)
 2. Pre-computed depth maps for 3D point recovery
 3. PnP + RANSAC for pose estimation
-4. Optional Bundle Adjustment for refinement
+4. GTSAM Bundle Adjustment for global pose optimization
 """
 
 import argparse
@@ -23,6 +23,17 @@ from hloc import extract_features, match_features
 from hloc.utils.io import get_keypoints, get_matches
 
 logger = logging.getLogger(__name__)
+
+# Check if GTSAM is available
+try:
+    import gtsam
+    from gtsam import symbol_shorthand
+    L = symbol_shorthand.L  # Landmark
+    X = symbol_shorthand.X  # Pose
+    GTSAM_AVAILABLE = True
+except ImportError:
+    GTSAM_AVAILABLE = False
+    logger.warning("GTSAM not available, BA will be skipped")
 
 
 # Feature extraction config - SuperPoint
@@ -174,10 +185,175 @@ def estimate_pose_pnp(pts_3d: np.ndarray, pts_2d: np.ndarray,
     return R, t, inliers.flatten(), True
 
 
+def pose_to_gtsam(T: np.ndarray) -> "gtsam.Pose3":
+    """Convert 4x4 transformation matrix to GTSAM Pose3."""
+    R = T[:3, :3]
+    t = T[:3, 3]
+    return gtsam.Pose3(gtsam.Rot3(R), gtsam.Point3(t))
+
+
+def gtsam_to_pose(pose3: "gtsam.Pose3") -> np.ndarray:
+    """Convert GTSAM Pose3 to 4x4 transformation matrix."""
+    T = np.eye(4)
+    T[:3, :3] = pose3.rotation().matrix()
+    T[:3, 3] = pose3.translation()
+    return T
+
+
+def run_bundle_adjustment(
+    poses: dict,
+    observations: list,
+    K: np.ndarray,
+    fix_first_pose: bool = True
+) -> dict:
+    """Run Bundle Adjustment using GTSAM.
+
+    Args:
+        poses: Dictionary mapping image name to 4x4 pose matrix
+        observations: List of observation dicts with:
+            - 'frame0': source frame name
+            - 'frame1': target frame name
+            - 'pts_3d': Nx3 3D points in frame0's camera coordinate
+            - 'pts_2d': Nx2 2D observations in frame1
+            - 'inliers': indices of inlier matches
+        K: 3x3 camera intrinsic matrix
+        fix_first_pose: Whether to fix the first pose
+
+    Returns:
+        optimized_poses: Dictionary with optimized poses
+    """
+    if not GTSAM_AVAILABLE:
+        logger.warning("GTSAM not available, skipping BA")
+        return poses
+
+    logger.info("Running Bundle Adjustment with GTSAM...")
+
+    # Create factor graph
+    graph = gtsam.NonlinearFactorGraph()
+
+    # Create initial estimates
+    initial = gtsam.Values()
+
+    # Map frame names to indices
+    frame_names = list(poses.keys())
+    frame_to_idx = {name: i for i, name in enumerate(frame_names)}
+
+    # Add initial pose estimates
+    for name, T in poses.items():
+        idx = frame_to_idx[name]
+        pose3 = pose_to_gtsam(T)
+        initial.insert(X(idx), pose3)
+
+    # Prior noise model for first pose (very tight if fixed)
+    if fix_first_pose:
+        prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([0.001, 0.001, 0.001, 0.001, 0.001, 0.001])  # rad, rad, rad, m, m, m
+        )
+        graph.add(gtsam.PriorFactorPose3(X(0), pose_to_gtsam(poses[frame_names[0]]), prior_noise))
+
+    # Camera calibration for GTSAM
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    cal = gtsam.Cal3_S2(fx, fy, 0.0, cx, cy)
+
+    # Noise model for projection (pixel noise)
+    projection_noise = gtsam.noiseModel.Isotropic.Sigma(2, 2.0)  # 2 pixel std
+
+    # Add projection factors
+    num_factors = 0
+    for obs in observations:
+        if 'pts_3d' not in obs or 'pts_2d' not in obs:
+            continue
+
+        frame0, frame1 = obs['frame0'], obs['frame1']
+        if frame0 not in frame_to_idx or frame1 not in frame_to_idx:
+            continue
+
+        idx0 = frame_to_idx[frame0]
+        idx1 = frame_to_idx[frame1]
+
+        pts_3d = obs['pts_3d']
+        pts_2d = obs['pts_2d']
+        inliers = obs.get('inliers', np.arange(len(pts_3d)))
+
+        # Get pose of frame0 to transform 3D points to world frame
+        T0 = poses[frame0]
+
+        # Add factors for inlier observations
+        for i in inliers[:100]:  # Limit to 100 points per pair for speed
+            if i >= len(pts_3d):
+                continue
+
+            # 3D point in frame0's camera coordinate
+            pt_cam0 = pts_3d[i]
+
+            # Transform to world frame
+            pt_world = (T0 @ np.array([*pt_cam0, 1.0]))[:3]
+
+            # 2D observation in frame1
+            pt_2d = pts_2d[i]
+
+            # Create projection factor
+            # This factor measures: "given camera pose X(idx1), the 3D point pt_world
+            # should project to pt_2d"
+            try:
+                factor = gtsam.GenericProjectionFactorCal3_S2(
+                    gtsam.Point2(pt_2d[0], pt_2d[1]),
+                    projection_noise,
+                    X(idx1),
+                    L(num_factors),  # Use unique landmark ID
+                    cal
+                )
+                graph.add(factor)
+
+                # Add landmark with strong prior (since we know it from depth)
+                landmark_noise = gtsam.noiseModel.Isotropic.Sigma(3, 0.05)  # 5cm std
+                graph.add(gtsam.PriorFactorPoint3(
+                    L(num_factors),
+                    gtsam.Point3(pt_world[0], pt_world[1], pt_world[2]),
+                    landmark_noise
+                ))
+                initial.insert(L(num_factors), gtsam.Point3(pt_world[0], pt_world[1], pt_world[2]))
+
+                num_factors += 1
+            except Exception as e:
+                continue
+
+    logger.info(f"Added {num_factors} projection factors")
+
+    if num_factors < 10:
+        logger.warning("Too few factors for BA, skipping")
+        return poses
+
+    # Optimize
+    try:
+        optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial)
+        result = optimizer.optimize()
+
+        # Extract optimized poses
+        optimized_poses = {}
+        for name in frame_names:
+            idx = frame_to_idx[name]
+            pose3 = result.atPose3(X(idx))
+            optimized_poses[name] = gtsam_to_pose(pose3)
+
+        # Report improvement
+        initial_error = graph.error(initial)
+        final_error = graph.error(result)
+        logger.info(f"BA complete: error {initial_error:.2f} -> {final_error:.2f}")
+
+        return optimized_poses
+
+    except Exception as e:
+        logger.error(f"BA failed: {e}")
+        return poses
+
+
 def run_pipeline(data_dir: Path, output_dir: Path,
                  visualize: bool = False,
                  concatenate_pcd: bool = True,
-                 voxel_size: float = 0.01) -> dict:
+                 voxel_size: float = 0.01,
+                 run_ba: bool = False) -> dict:
     """Run the stereo depth pipeline.
 
     Args:
@@ -186,6 +362,7 @@ def run_pipeline(data_dir: Path, output_dir: Path,
         visualize: Whether to show visualizations
         concatenate_pcd: Whether to concatenate point clouds
         voxel_size: Voxel size for point cloud downsampling
+        run_ba: Whether to run Bundle Adjustment
 
     Returns:
         results: Dictionary with poses and statistics
@@ -281,6 +458,10 @@ def run_pipeline(data_dir: Path, output_dir: Path,
     T_world = np.eye(4)  # Cumulative pose
 
     pose_results = []
+    ba_observations = []  # Collect observations for BA
+
+    # Store K matrix for BA
+    sample_K = frame_info[image_list[0]]["K"]
 
     for i in tqdm(range(len(image_list) - 1), desc="PnP"):
         img0, img1 = image_list[i], image_list[i + 1]
@@ -367,9 +548,22 @@ def run_pipeline(data_dir: Path, output_dir: Path,
             "translation": np.linalg.norm(t),
         })
 
+        # Collect observation for BA
+        ba_observations.append({
+            "frame0": img0,
+            "frame1": img1,
+            "pts_3d": pts_3d_valid,
+            "pts_2d": pts_2d_valid,
+            "inliers": inliers,
+        })
+
         logger.debug(f"{img0} -> {img1}: matches={num_matches}, "
                     f"depth_valid={depth_valid.sum()}, inliers={len(inliers)}, "
                     f"t={np.linalg.norm(t):.3f}m")
+
+    # Step 5.5: Bundle Adjustment (optional)
+    if run_ba and GTSAM_AVAILABLE and len(ba_observations) > 0:
+        poses = run_bundle_adjustment(poses, ba_observations, sample_K)
 
     # Save poses
     poses_file = output_dir / "poses.txt"
@@ -517,6 +711,10 @@ def main():
         help="Voxel size for point cloud downsampling (default: 0.01m)"
     )
     parser.add_argument(
+        "--ba", action="store_true",
+        help="Run Bundle Adjustment using GTSAM"
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable verbose logging"
     )
@@ -537,6 +735,7 @@ def main():
         output_dir=args.output_dir,
         concatenate_pcd=not args.no_pcd,
         voxel_size=args.voxel_size,
+        run_ba=args.ba,
     )
 
     logger.info(f"Pipeline complete: {results['num_successful']}/{results['num_frames']-1} "
