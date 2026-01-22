@@ -9,4 +9,4 @@ datasets/*
 !datasets/sacre_coeur/
 datasets/sacre_coeur/query
 
-.claude\settings.local.json
+.claude/settings.local.json
