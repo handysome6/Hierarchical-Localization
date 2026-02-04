@@ -501,6 +501,34 @@ def incremental_pose_initialization(
     return poses, pnp_results, list(unregistered)
 
 
+def load_poses_from_json(json_path: Path) -> dict:
+    """Load camera poses from a JSON file.
+
+    Args:
+        json_path: Path to JSON file with format:
+            {
+                "<timestamp>.jpg": [[r11, r12, r13, t1], [r21, r22, r23, t2], [r31, r32, r33, t3]],
+                ...
+            }
+            Each value is a 3x4 [R|t] matrix.
+
+    Returns:
+        poses: Dict[str, np.ndarray] - Image name to 4x4 pose matrix
+    """
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+
+    poses = {}
+    for img_name, matrix_3x4 in data.items():
+        # Convert 3x4 [R|t] to 4x4 homogeneous matrix
+        T = np.eye(4)
+        T[:3, :] = np.array(matrix_3x4)
+        poses[img_name] = T
+
+    logger.info(f"Loaded {len(poses)} poses from {json_path}")
+    return poses
+
+
 def run_pipeline(data_dir: Path, output_dir: Path,
                  visualize: bool = False,
                  concatenate_pcd: bool = True,
@@ -510,7 +538,8 @@ def run_pipeline(data_dir: Path, output_dir: Path,
                  max_exhaustive_frames: int = 50,
                  incremental_init: bool = True,
                  min_init_inliers: int = 15,
-                 min_ba_inliers: int = 30) -> dict:
+                 min_ba_inliers: int = 30,
+                 extrinsics_json: Path = None) -> dict:
     """Run the stereo depth pipeline.
 
     Args:
@@ -525,6 +554,7 @@ def run_pipeline(data_dir: Path, output_dir: Path,
         incremental_init: Use incremental best-match initialization (order-independent)
         min_init_inliers: Minimum inlier count for valid registration in incremental init
         min_ba_inliers: Minimum inlier count for BA edges (higher = more conservative)
+        extrinsics_json: Path to JSON file with pre-computed camera poses (skips pose estimation)
 
     Returns:
         results: Dictionary with poses and statistics
@@ -671,7 +701,73 @@ def run_pipeline(data_dir: Path, output_dir: Path,
         return pts_3d_valid, pts_2d_valid, inliers, R, t, True, None, num_matches
 
     # Step 5a: Pose initialization
-    if use_exhaustive and incremental_init:
+    if extrinsics_json is not None:
+        # Use pre-computed poses from JSON file (as initial state for optional BA)
+        logger.info(f"Loading poses from {extrinsics_json}...")
+        all_poses = load_poses_from_json(extrinsics_json)
+
+        # Filter to only include images in our image_list
+        poses = {}
+        missing_poses = []
+        for img_name in image_list:
+            if img_name in all_poses:
+                poses[img_name] = all_poses[img_name]
+            else:
+                missing_poses.append(img_name)
+                logger.warning(f"No pose found for {img_name} in extrinsics JSON")
+
+        if missing_poses:
+            logger.warning(f"Missing poses for {len(missing_poses)} images")
+
+        logger.info(f"Loaded poses for {len(poses)}/{len(image_list)} images")
+
+        # If BA requested, collect observations from PnP to refine the poses
+        if run_ba:
+            logger.info("Collecting BA observations from all pairs...")
+            all_pairs = [
+                (image_list[i], image_list[j])
+                for i in range(len(image_list))
+                for j in range(i + 1, len(image_list))
+            ]
+
+            pair_best = {}  # Deduplicate: only keep best direction per pair
+            for img0, img1 in tqdm(all_pairs, desc="Computing PnP for BA"):
+                if img0 not in poses or img1 not in poses:
+                    continue
+
+                # Try both directions
+                for src, dst in [(img0, img1), (img1, img0)]:
+                    pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = (
+                        process_pair(src, dst)
+                    )
+
+                    if success and inliers is not None:
+                        canonical_key = tuple(sorted([src, dst]))
+                        num_inliers = len(inliers)
+
+                        if canonical_key not in pair_best or num_inliers > pair_best[canonical_key]["num_inliers"]:
+                            T_rel = np.eye(4)
+                            T_rel[:3, :3] = R
+                            T_rel[:3, 3] = t
+                            pair_best[canonical_key] = {
+                                "frame0": src,
+                                "frame1": dst,
+                                "T_rel": T_rel,
+                                "num_inliers": num_inliers,
+                            }
+
+            # Filter by inlier threshold and consistency
+            effective_min_ba_inliers = max(min_init_inliers, min_ba_inliers)
+            for obs in pair_best.values():
+                if obs["num_inliers"] >= effective_min_ba_inliers:
+                    ba_observations.append(obs)
+
+            logger.info(
+                f"Collected {len(ba_observations)} BA observation pairs "
+                f"(from {len(pair_best)} unique pairs)"
+            )
+
+    elif use_exhaustive and incremental_init:
         # Incremental initialization (order-independent)
         logger.info("Using incremental pose initialization (order-independent)...")
         poses, pnp_results, unregistered = incremental_pose_initialization(
@@ -1001,6 +1097,11 @@ def main():
         help="Minimum inlier count for BA edges (default: 30, higher = more conservative)"
     )
     parser.add_argument(
+        "--extrinsics_json", type=Path, default=None,
+        help="JSON file with pre-computed camera poses (skips pose estimation). "
+             "Format: {\"<timestamp>.jpg\": [[r11,r12,r13,t1], [r21,r22,r23,t2], [r31,r32,r33,t3]], ...}"
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable verbose logging"
     )
@@ -1027,6 +1128,7 @@ def main():
         incremental_init=not args.no_incremental_init,
         min_init_inliers=args.min_init_inliers,
         min_ba_inliers=args.min_ba_inliers,
+        extrinsics_json=args.extrinsics_json,
     )
 
     logger.info(f"Pipeline complete: {results['num_successful']}/{results['num_frames']-1} "
