@@ -359,13 +359,158 @@ def run_bundle_adjustment(
         return poses
 
 
+def incremental_pose_initialization(
+    image_list: list,
+    process_pair_func,
+    min_inliers: int = 15,
+    logger=None,
+) -> tuple:
+    """
+    Incremental pose initialization that doesn't depend on image order.
+
+    Algorithm:
+    1. First frame is set to identity (origin)
+    2. Maintain a "registered" set of frames with known poses
+    3. Loop:
+       a. For each unregistered frame, find the best match with registered frames
+       b. Use PnP to compute the new frame's pose relative to the best match
+       c. Add the new frame to the registered set
+    4. Continue until all frames are registered or no more can be added
+    5. Collect all valid pair observations for BA
+
+    Args:
+        image_list: List of image names
+        process_pair_func: Function that processes a pair and returns
+            (pts_3d, pts_2d, inliers, R, t, success, reason, num_matches)
+        min_inliers: Minimum inlier count threshold for valid registration
+        logger: Logger instance (optional)
+
+    Returns:
+        poses: Dict[str, np.ndarray] - Image name to 4x4 pose matrix
+        pnp_results: Dict[tuple, dict] - PnP results for all successful pairs
+        unregistered: List[str] - Images that couldn't be registered
+    """
+    if logger is None:
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+    n_images = len(image_list)
+    if n_images == 0:
+        return {}, {}, []
+
+    # Pass 1: Pre-compute PnP results for all pairs
+    logger.info("Pass 1: Pre-computing PnP results for all pairs...")
+    pnp_results = {}  # (img0, img1) -> {R, t, inliers, num_inliers, T_rel}
+
+    all_pairs = [
+        (image_list[i], image_list[j])
+        for i in range(n_images)
+        for j in range(i + 1, n_images)
+    ]
+
+    for img0, img1 in tqdm(all_pairs, desc="Pre-computing PnP"):
+        # Try both directions to get the best result
+        for src, dst in [(img0, img1), (img1, img0)]:
+            pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = (
+                process_pair_func(src, dst)
+            )
+
+            if success and inliers is not None and len(inliers) >= min_inliers:
+                T_rel = np.eye(4)
+                T_rel[:3, :3] = R
+                T_rel[:3, 3] = t
+
+                key = (src, dst)
+                pnp_results[key] = {
+                    "R": R,
+                    "t": t,
+                    "inliers": inliers,
+                    "num_inliers": len(inliers),
+                    "T_rel": T_rel,
+                    "num_matches": num_matches,
+                }
+
+    logger.info(f"Pre-computed {len(pnp_results)} valid PnP results")
+
+    # Pass 2: Greedy incremental registration
+    logger.info("Pass 2: Incremental pose registration...")
+
+    # First frame is identity (origin)
+    poses = {image_list[0]: np.eye(4)}
+    registered = {image_list[0]}
+    unregistered = set(image_list[1:])
+
+    registration_order = [image_list[0]]
+
+    while unregistered:
+        # Find the best candidate: unregistered frame with most inliers to any registered frame
+        best_candidate = None
+        best_reference = None
+        best_inliers = 0
+        best_key = None
+
+        for candidate in unregistered:
+            for ref in registered:
+                # Check both directions
+                for key in [(ref, candidate), (candidate, ref)]:
+                    if key in pnp_results:
+                        result = pnp_results[key]
+                        if result["num_inliers"] > best_inliers:
+                            best_inliers = result["num_inliers"]
+                            best_candidate = candidate
+                            best_reference = ref
+                            best_key = key
+
+        if best_candidate is None:
+            # No more frames can be registered
+            logger.warning(
+                f"Cannot register {len(unregistered)} frames: "
+                f"{list(unregistered)[:5]}{'...' if len(unregistered) > 5 else ''}"
+            )
+            break
+
+        # Compute pose for the new frame
+        result = pnp_results[best_key]
+        T_ref = poses[best_reference]
+
+        if best_key[0] == best_reference:
+            # Reference -> Candidate: T_cand = T_ref @ inv(T_rel)
+            T_candidate = T_ref @ np.linalg.inv(result["T_rel"])
+        else:
+            # Candidate -> Reference: need to invert
+            # T_rel maps points from candidate to reference
+            # So T_ref = T_cand @ inv(T_rel), meaning T_cand = T_ref @ T_rel
+            T_candidate = T_ref @ result["T_rel"]
+
+        poses[best_candidate] = T_candidate
+        registered.add(best_candidate)
+        unregistered.remove(best_candidate)
+        registration_order.append(best_candidate)
+
+        logger.debug(
+            f"Registered {best_candidate} via {best_reference} "
+            f"({best_inliers} inliers)"
+        )
+
+    logger.info(
+        f"Registered {len(registered)}/{n_images} frames "
+        f"({len(unregistered)} unregistered)"
+    )
+
+    return poses, pnp_results, list(unregistered)
+
+
 def run_pipeline(data_dir: Path, output_dir: Path,
                  visualize: bool = False,
                  concatenate_pcd: bool = True,
                  voxel_size: float = 0.01,
                  run_ba: bool = False,
                  exhaustive_pairs: bool = True,
-                 max_exhaustive_frames: int = 50) -> dict:
+                 max_exhaustive_frames: int = 50,
+                 incremental_init: bool = True,
+                 min_init_inliers: int = 15,
+                 min_ba_inliers: int = 30) -> dict:
     """Run the stereo depth pipeline.
 
     Args:
@@ -377,6 +522,9 @@ def run_pipeline(data_dir: Path, output_dir: Path,
         run_ba: Whether to run Bundle Adjustment
         exhaustive_pairs: Use exhaustive pairing for better BA constraints
         max_exhaustive_frames: Max frames for exhaustive pairing (falls back to sequential)
+        incremental_init: Use incremental best-match initialization (order-independent)
+        min_init_inliers: Minimum inlier count for valid registration in incremental init
+        min_ba_inliers: Minimum inlier count for BA edges (higher = more conservative)
 
     Returns:
         results: Dictionary with poses and statistics
@@ -479,10 +627,6 @@ def run_pipeline(data_dir: Path, output_dir: Path,
     # Note: hloc automatically scales keypoint coordinates back to original image size
     # (see extract_features.py line 274), so no manual scaling is needed
 
-    # Initialize poses (first frame is identity)
-    poses = {image_list[0]: np.eye(4)}
-    T_world = np.eye(4)  # Cumulative pose
-
     pose_results = []
     ba_observations = []  # Collect observations for BA
 
@@ -526,90 +670,202 @@ def run_pipeline(data_dir: Path, output_dir: Path,
 
         return pts_3d_valid, pts_2d_valid, inliers, R, t, True, None, num_matches
 
-    # Step 5a: Sequential PnP for initial pose estimates
-    logger.info("Computing initial poses from sequential pairs...")
-    for i in tqdm(range(len(image_list) - 1), desc="Sequential PnP"):
-        img0, img1 = image_list[i], image_list[i + 1]
+    # Step 5a: Pose initialization
+    if use_exhaustive and incremental_init:
+        # Incremental initialization (order-independent)
+        logger.info("Using incremental pose initialization (order-independent)...")
+        poses, pnp_results, unregistered = incremental_pose_initialization(
+            image_list=image_list,
+            process_pair_func=process_pair,
+            min_inliers=min_init_inliers,
+            logger=logger,
+        )
 
-        pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = process_pair(img0, img1)
+        if unregistered:
+            logger.warning(
+                f"Could not register {len(unregistered)} frames: {unregistered}"
+            )
 
-        if not success:
-            logger.warning(f"Sequential PnP failed for {img0} -> {img1}: {reason}")
-            poses[img1] = T_world.copy()
+        # Convert pnp_results to pose_results format for logging
+        for (img0, img1), result in pnp_results.items():
             pose_results.append({
-                "frame0": img0, "frame1": img1,
-                "success": False, "reason": reason
+                "frame0": img0,
+                "frame1": img1,
+                "success": True,
+                "num_matches": result.get("num_matches", 0),
+                "num_inliers": result["num_inliers"],
+                "translation": np.linalg.norm(result["t"]),
             })
-            continue
 
-        # Relative pose (from frame0 to frame1)
-        T_rel = np.eye(4)
-        T_rel[:3, :3] = R
-        T_rel[:3, 3] = t
-
-        # Accumulate pose: T_world_new = T_world @ inv(T_rel)
-        T_world = T_world @ np.linalg.inv(T_rel)
-        poses[img1] = T_world.copy()
-
-        pose_results.append({
-            "frame0": img0, "frame1": img1,
-            "success": True,
-            "num_matches": num_matches,
-            "num_depth_valid": len(pts_3d),
-            "num_inliers": len(inliers),
-            "translation": np.linalg.norm(t),
-        })
-
-        logger.debug(f"{img0} -> {img1}: matches={num_matches}, "
-                    f"depth_valid={len(pts_3d)}, inliers={len(inliers)}, "
-                    f"t={np.linalg.norm(t):.3f}m")
-
-    # Step 5b: Collect BA observations from ALL pairs (exhaustive)
-    # Store measured relative poses from PnP for use in BA
-    if use_exhaustive and run_ba:
-        logger.info("Collecting BA observations from all pairs...")
-        all_pairs = [(image_list[i], image_list[j])
-                     for i in range(len(image_list))
-                     for j in range(i + 1, len(image_list))]
-
-        for img0, img1 in tqdm(all_pairs, desc="BA observations"):
-            # Skip if either frame doesn't have a pose
+        # Collect BA observations from all successful PnP results
+        # Only keep one direction per pair (the one with more inliers)
+        # to avoid conflicting constraints
+        pair_best = {}  # (min_img, max_img) -> best observation
+        for (img0, img1), result in pnp_results.items():
             if img0 not in poses or img1 not in poses:
                 continue
 
-            pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = process_pair(img0, img1)
+            # Canonical key (sorted) to detect duplicates
+            canonical_key = tuple(sorted([img0, img1]))
+            num_inliers = result["num_inliers"]
 
-            if success and inliers is not None:
-                # Store the MEASURED relative pose from PnP
-                T_rel_measured = np.eye(4)
-                T_rel_measured[:3, :3] = R
-                T_rel_measured[:3, 3] = t
-                ba_observations.append({
+            if canonical_key not in pair_best or num_inliers > pair_best[canonical_key]["num_inliers"]:
+                pair_best[canonical_key] = {
                     "frame0": img0,
                     "frame1": img1,
-                    "T_rel": T_rel_measured,  # Measured relative pose
-                    "num_inliers": len(inliers),
-                })
-        logger.info(f"Collected {len(ba_observations)} BA observation pairs")
+                    "T_rel": result["T_rel"],
+                    "num_inliers": num_inliers,
+                }
+
+        # Filter by higher threshold for BA (more conservative)
+        # Also check consistency with initialized poses
+        effective_min_ba_inliers = max(min_init_inliers, min_ba_inliers)
+        num_inlier_filtered = 0
+        num_consistency_filtered = 0
+
+        for obs in pair_best.values():
+            if obs["num_inliers"] < effective_min_ba_inliers:
+                num_inlier_filtered += 1
+                logger.debug(
+                    f"Skipping BA edge {obs['frame0']} -> {obs['frame1']}: "
+                    f"only {obs['num_inliers']} inliers (need {effective_min_ba_inliers})"
+                )
+                continue
+
+            # Consistency check: compare measured T_rel with expected from poses
+            frame0, frame1 = obs["frame0"], obs["frame1"]
+            T0, T1 = poses[frame0], poses[frame1]
+            T_rel_measured = obs["T_rel"]
+
+            # Expected: T1 = T0 @ inv(T_rel), so T_rel_expected = inv(inv(T0) @ T1)
+            T_rel_expected = np.linalg.inv(np.linalg.inv(T0) @ T1)
+
+            # Compare translation magnitude
+            t_measured = np.linalg.norm(T_rel_measured[:3, 3])
+            t_expected = np.linalg.norm(T_rel_expected[:3, 3])
+
+            # Allow 50% translation difference or 0.5m absolute, whichever is larger
+            t_threshold = max(0.5 * max(t_measured, t_expected), 0.5)
+            t_diff = abs(t_measured - t_expected)
+
+            if t_diff > t_threshold:
+                num_consistency_filtered += 1
+                logger.debug(
+                    f"Skipping BA edge {frame0} -> {frame1}: "
+                    f"translation inconsistent (measured={t_measured:.3f}m, "
+                    f"expected={t_expected:.3f}m, diff={t_diff:.3f}m)"
+                )
+                continue
+
+            ba_observations.append(obs)
+
+        logger.info(
+            f"Collected {len(ba_observations)} BA observation pairs "
+            f"(from {len(pair_best)} unique pairs: "
+            f"{num_inlier_filtered} filtered by inliers, "
+            f"{num_consistency_filtered} filtered by consistency)"
+        )
+
     else:
-        # Use sequential observations only
-        for i in range(len(image_list) - 1):
+        # Sequential initialization (original behavior, backward compatible)
+        logger.info("Using sequential pose initialization...")
+        poses = {image_list[0]: np.eye(4)}
+        T_world = np.eye(4)  # Cumulative pose
+
+        for i in tqdm(range(len(image_list) - 1), desc="Sequential PnP"):
             img0, img1 = image_list[i], image_list[i + 1]
-            if img0 not in poses or img1 not in poses:
-                continue
 
-            pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = process_pair(img0, img1)
+            pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = process_pair(
+                img0, img1
+            )
 
-            if success and inliers is not None:
-                T_rel_measured = np.eye(4)
-                T_rel_measured[:3, :3] = R
-                T_rel_measured[:3, 3] = t
-                ba_observations.append({
+            if not success:
+                logger.warning(f"Sequential PnP failed for {img0} -> {img1}: {reason}")
+                poses[img1] = T_world.copy()
+                pose_results.append({
                     "frame0": img0,
                     "frame1": img1,
-                    "T_rel": T_rel_measured,
-                    "num_inliers": len(inliers),
+                    "success": False,
+                    "reason": reason,
                 })
+                continue
+
+            # Relative pose (from frame0 to frame1)
+            T_rel = np.eye(4)
+            T_rel[:3, :3] = R
+            T_rel[:3, 3] = t
+
+            # Accumulate pose: T_world_new = T_world @ inv(T_rel)
+            T_world = T_world @ np.linalg.inv(T_rel)
+            poses[img1] = T_world.copy()
+
+            pose_results.append({
+                "frame0": img0,
+                "frame1": img1,
+                "success": True,
+                "num_matches": num_matches,
+                "num_depth_valid": len(pts_3d),
+                "num_inliers": len(inliers),
+                "translation": np.linalg.norm(t),
+            })
+
+            logger.debug(
+                f"{img0} -> {img1}: matches={num_matches}, "
+                f"depth_valid={len(pts_3d)}, inliers={len(inliers)}, "
+                f"t={np.linalg.norm(t):.3f}m"
+            )
+
+        # Step 5b: Collect BA observations for sequential mode
+        if run_ba:
+            if use_exhaustive:
+                # Collect from all pairs even if using sequential init
+                logger.info("Collecting BA observations from all pairs...")
+                all_pairs = [
+                    (image_list[i], image_list[j])
+                    for i in range(len(image_list))
+                    for j in range(i + 1, len(image_list))
+                ]
+
+                for img0, img1 in tqdm(all_pairs, desc="BA observations"):
+                    if img0 not in poses or img1 not in poses:
+                        continue
+
+                    pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = (
+                        process_pair(img0, img1)
+                    )
+
+                    if success and inliers is not None:
+                        T_rel_measured = np.eye(4)
+                        T_rel_measured[:3, :3] = R
+                        T_rel_measured[:3, 3] = t
+                        ba_observations.append({
+                            "frame0": img0,
+                            "frame1": img1,
+                            "T_rel": T_rel_measured,
+                            "num_inliers": len(inliers),
+                        })
+                logger.info(f"Collected {len(ba_observations)} BA observation pairs")
+            else:
+                # Use sequential observations only
+                for i in range(len(image_list) - 1):
+                    img0, img1 = image_list[i], image_list[i + 1]
+                    if img0 not in poses or img1 not in poses:
+                        continue
+
+                    pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = (
+                        process_pair(img0, img1)
+                    )
+
+                    if success and inliers is not None:
+                        T_rel_measured = np.eye(4)
+                        T_rel_measured[:3, :3] = R
+                        T_rel_measured[:3, 3] = t
+                        ba_observations.append({
+                            "frame0": img0,
+                            "frame1": img1,
+                            "T_rel": T_rel_measured,
+                            "num_inliers": len(inliers),
+                        })
 
     # Step 5.5: Bundle Adjustment (optional)
     if run_ba and GTSAM_AVAILABLE and len(ba_observations) > 0:
@@ -733,6 +989,18 @@ def main():
         help="Max frames for exhaustive pairing (default: 50)"
     )
     parser.add_argument(
+        "--no_incremental_init", action="store_true",
+        help="Disable incremental initialization (use sequential initialization)"
+    )
+    parser.add_argument(
+        "--min_init_inliers", type=int, default=15,
+        help="Minimum inlier count for incremental initialization (default: 15)"
+    )
+    parser.add_argument(
+        "--min_ba_inliers", type=int, default=30,
+        help="Minimum inlier count for BA edges (default: 30, higher = more conservative)"
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true",
         help="Enable verbose logging"
     )
@@ -756,6 +1024,9 @@ def main():
         run_ba=args.ba,
         exhaustive_pairs=not args.sequential_pairs,
         max_exhaustive_frames=args.max_exhaustive,
+        incremental_init=not args.no_incremental_init,
+        min_init_inliers=args.min_init_inliers,
+        min_ba_inliers=args.min_ba_inliers,
     )
 
     logger.info(f"Pipeline complete: {results['num_successful']}/{results['num_frames']-1} "
