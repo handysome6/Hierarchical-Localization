@@ -468,12 +468,32 @@ def incremental_pose_initialization(
     # Pass 2: Greedy incremental registration
     logger.info("Pass 2: Incremental pose registration...")
 
-    # First frame is identity (origin)
-    poses = {image_list[0]: np.eye(4)}
-    registered = {image_list[0]}
-    unregistered = set(image_list[1:])
+    # Seeding on image_list[0] is brittle: when that frame happens to be a
+    # visual outlier with no qualifying PnP edges, the greedy loop stalls
+    # on iteration 1 and every other frame is dropped. Pick the seed by
+    # total inlier connectivity instead.
+    connectivity = defaultdict(int)
+    for (a, b), res in pnp_results.items():
+        connectivity[a] += res["num_inliers"]
+        connectivity[b] += res["num_inliers"]
 
-    registration_order = [image_list[0]]
+    seed = max(
+        image_list,
+        key=lambda n: (connectivity.get(n, 0), -image_list.index(n)),
+    )
+    if connectivity.get(seed, 0) == 0:
+        logger.warning("No PnP edges available; cannot register any frame")
+        return {}, pnp_results, list(image_list)
+
+    logger.info(
+        f"Seeded registration from {seed} "
+        f"(total inlier connectivity: {connectivity[seed]})"
+    )
+
+    poses = {seed: np.eye(4)}
+    registered = {seed}
+    unregistered = set(image_list) - {seed}
+    registration_order = [seed]
 
     while unregistered:
         # Find the best candidate: unregistered frame with most inliers to any registered frame
@@ -495,9 +515,10 @@ def incremental_pose_initialization(
                             best_key = key
 
         if best_candidate is None:
-            # No more frames can be registered
+            # No more frames can be registered (disconnected from main component).
             logger.warning(
-                f"Cannot register {len(unregistered)} frames: "
+                f"Cannot register {len(unregistered)} frames "
+                f"(disconnected from main component): "
                 f"{list(unregistered)[:5]}{'...' if len(unregistered) > 5 else ''}"
             )
             break
@@ -510,9 +531,7 @@ def incremental_pose_initialization(
             # Reference -> Candidate: T_cand = T_ref @ inv(T_rel)
             T_candidate = T_ref @ np.linalg.inv(result["T_rel"])
         else:
-            # Candidate -> Reference: need to invert
-            # T_rel maps points from candidate to reference
-            # So T_ref = T_cand @ inv(T_rel), meaning T_cand = T_ref @ T_rel
+            # Candidate -> Reference: T_cand = T_ref @ T_rel
             T_candidate = T_ref @ result["T_rel"]
 
         poses[best_candidate] = T_candidate
