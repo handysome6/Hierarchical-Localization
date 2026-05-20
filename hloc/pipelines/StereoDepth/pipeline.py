@@ -245,21 +245,11 @@ def run_bundle_adjustment(
     frame_names = list(poses.keys())
     frame_to_idx = {name: i for i, name in enumerate(frame_names)}
 
-    # Add initial pose estimates
-    for name, T in poses.items():
-        idx = frame_to_idx[name]
-        pose3 = pose_to_gtsam(T)
-        initial.insert(X(idx), pose3)
-
-    # Prior noise model for first pose (very tight if fixed)
-    if fix_first_pose:
-        prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([0.001, 0.001, 0.001, 0.001, 0.001, 0.001])  # rad, rad, rad, m, m, m
-        )
-        graph.add(gtsam.PriorFactorPose3(X(0), pose_to_gtsam(poses[frame_names[0]]), prior_noise))
-
-    # Collect relative pose measurements from observations
-    # Use the measured relative poses from PnP (stored in observations)
+    # Collect relative pose measurements from observations FIRST so we know
+    # which frames will actually appear in the factor graph. Variables that
+    # are inserted into `initial` but referenced by zero factors make GTSAM's
+    # Levenberg-Marquardt elimination throw "inconsistent arguments".
+    # Use the MEASURED relative poses from PnP (stored in observations).
     relative_poses = {}  # (frame0, frame1) -> (T_rel, num_inliers)
 
     for obs in observations:
@@ -271,7 +261,6 @@ def run_bundle_adjustment(
         if num_inliers < 10:
             continue
 
-        # Use the MEASURED relative pose from PnP (not computed from accumulated poses)
         T_rel = obs.get('T_rel')
         if T_rel is None:
             continue
@@ -279,6 +268,46 @@ def run_bundle_adjustment(
         key = (frame0, frame1)
         if key not in relative_poses or num_inliers > relative_poses[key][1]:
             relative_poses[key] = (T_rel, num_inliers)
+
+    # Identify frames that participate in at least one factor edge.
+    constrained_frames = set()
+    for (frame0, frame1) in relative_poses.keys():
+        constrained_frames.add(frame0)
+        constrained_frames.add(frame1)
+
+    isolated_frames = [n for n in frame_names if n not in constrained_frames]
+    if isolated_frames:
+        logger.warning(
+            f"Skipping {len(isolated_frames)} unconstrained frame(s) in BA "
+            f"(no qualifying factor edges): {isolated_frames}"
+        )
+
+    # Pick a prior anchor that is actually in the factor graph; falling back
+    # to the first constrained frame if frame_names[0] was isolated.
+    anchor_name = frame_names[0]
+    if fix_first_pose and anchor_name not in constrained_frames:
+        if not constrained_frames:
+            logger.warning("No constrained frames available for BA, skipping")
+            return poses
+        anchor_name = next(n for n in frame_names if n in constrained_frames)
+        logger.warning(
+            f"First frame {frame_names[0]} is isolated; anchoring prior at {anchor_name}"
+        )
+
+    # Add initial pose estimates only for frames the graph will touch.
+    for name in frame_names:
+        if name not in constrained_frames:
+            continue
+        idx = frame_to_idx[name]
+        initial.insert(X(idx), pose_to_gtsam(poses[name]))
+
+    # Prior noise model for the anchor pose (very tight if fixed)
+    if fix_first_pose:
+        prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([0.001, 0.001, 0.001, 0.001, 0.001, 0.001])  # rad, rad, rad, m, m, m
+        )
+        anchor_idx = frame_to_idx[anchor_name]
+        graph.add(gtsam.PriorFactorPose3(X(anchor_idx), pose_to_gtsam(poses[anchor_name]), prior_noise))
 
     # Add BetweenFactorPose3 for each relative pose constraint
     num_factors = 0
@@ -321,12 +350,15 @@ def run_bundle_adjustment(
         optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial, params)
         result = optimizer.optimize()
 
-        # Extract optimized poses
+        # Extract optimized poses; isolated frames keep their pre-BA pose.
         optimized_poses = {}
         for name in frame_names:
-            idx = frame_to_idx[name]
-            pose3 = result.atPose3(X(idx))
-            optimized_poses[name] = gtsam_to_pose(pose3)
+            if name in constrained_frames:
+                idx = frame_to_idx[name]
+                pose3 = result.atPose3(X(idx))
+                optimized_poses[name] = gtsam_to_pose(pose3)
+            else:
+                optimized_poses[name] = poses[name]
 
         # Report improvement
         initial_error = graph.error(initial)
