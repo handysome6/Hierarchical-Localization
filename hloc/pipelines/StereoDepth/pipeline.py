@@ -1,1106 +1,261 @@
-"""
-Stereo Depth Pipeline: hloc feature matching + depth-based PnP + GTSAM BA
+"""StereoDepth pipeline: hloc matching + depth-based PnP + GTSAM pose-graph BA.
 
-This pipeline uses:
-1. hloc for feature extraction (SuperPoint) and matching (LightGlue)
-2. Pre-computed depth maps for 3D point recovery
-3. PnP + RANSAC for pose estimation
-4. GTSAM Bundle Adjustment for global pose optimization
+This file is the thin orchestrator. Every stage now lives in its own module
+under ``hloc/pipelines/StereoDepth/``:
+
+- ``dataset``           — scan disk -> ``list[FrameInfo]``
+- ``pair_selection``    — pair-list policies (exhaustive / sequential)
+- ``matching``          — hloc feature extraction + matching
+- ``correspondence``    — per-pair 3D-2D correspondence assembly
+- ``pose_estimators``   — per-pair pose (default: ``DepthPnPEstimator``)
+- ``pose_initializers`` — global init (incremental / sequential / from JSON)
+- ``optimizers``        — pose-graph optimization (default: ``GtsamPoseGraphOptimizer``)
+- ``fusion``            — point-cloud concatenation
+- ``io``                — pose I/O
+
+The CLI and ``run_pipeline(...)`` signature are preserved so existing scripts
+(notably ``run_test.py``) keep working.
 """
 
 import argparse
 import logging
 from pathlib import Path
-from collections import defaultdict
-import json
+from typing import Dict, List, Optional
 
-import cv2
 import numpy as np
-import h5py
 from tqdm import tqdm
 
-from hloc import extract_features, match_features
-from hloc.utils.io import get_keypoints, get_matches
+from .correspondence import build_correspondence
+from .dataset import scan_frames
+from .fusion import merge_point_clouds
+from .io import save_pose_results, save_poses_txt
+from .matching import run_matching
+from .optimizers import GTSAM_AVAILABLE, GtsamPoseGraphOptimizer
+from .pair_selection import generate_pairs
+from .pose_estimators import DepthPnPEstimator
+from .pose_initializers import (
+    IncrementalInitializer,
+    JsonInitializer,
+    SequentialInitializer,
+)
+from .types import (
+    FrameInfo,
+    GlobalPoses,
+    PoseGraphEdge,
+    RelativePose,
+    RelativePoseMap,
+)
 
 logger = logging.getLogger(__name__)
 
-# Check if GTSAM is available
-try:
-    import gtsam
-    from gtsam import symbol_shorthand
-    X = symbol_shorthand.X  # Pose
-    GTSAM_AVAILABLE = True
-except ImportError:
-    GTSAM_AVAILABLE = False
-    logger.warning("GTSAM not available, BA will be skipped")
+# Re-exported for backward compatibility with ``run_test.py``:
+# ``from pipeline import run_pipeline, GTSAM_AVAILABLE``.
+__all__ = ["run_pipeline", "GTSAM_AVAILABLE", "main"]
 
 
-# Feature extraction config - SuperPoint
-EXTRACT_CONF = {
-    "output": "feats-superpoint-n4096-r1600",
-    "model": {
-        "name": "superpoint",
-        "nms_radius": 3,
-        "max_keypoints": 4096,
-    },
-    "preprocessing": {
-        "grayscale": True,
-        "resize_max": 1600,  # Resize for speed, original is 4032x3036
-    },
-}
-
-# Matching config - LightGlue
-MATCH_CONF = {
-    "output": "matches-lightglue",
-    "model": {
-        "name": "lightglue",
-        "features": "superpoint",
-    },
-}
-
-
-def load_camera_intrinsics(k_txt_path: Path) -> tuple:
-    """Load camera intrinsics from K.txt file.
-
-    Format:
-        Line 1: fx 0 cx 0 fy cy 0 0 1 (9 values, row-major 3x3)
-        Line 2: baseline in meters
-
-    Returns:
-        K: 3x3 intrinsic matrix
-        baseline: stereo baseline in meters
+def _estimate_all_relative_poses(
+    pairs: List,
+    frame_info: Dict[str, FrameInfo],
+    features_h5: Path,
+    matches_h5: Path,
+    estimator: DepthPnPEstimator,
+    try_both_directions: bool = True,
+) -> RelativePoseMap:
+    """Run the per-pair estimator across every pair (and optionally each
+    direction). Returns a directed ``(src, dst) -> RelativePose`` map.
     """
-    with open(k_txt_path, 'r') as f:
-        lines = f.readlines()
+    relative_poses: RelativePoseMap = {}
+    for img0, img1 in tqdm(pairs, desc="Per-pair PnP"):
+        directions = (
+            [(img0, img1), (img1, img0)] if try_both_directions else [(img0, img1)]
+        )
+        for src, dst in directions:
+            corr = build_correspondence(src, dst, frame_info, features_h5, matches_h5)
+            if corr is None:
+                continue
+            rel = estimator.estimate(corr)
+            if rel is None:
+                continue
+            relative_poses[(src, dst)] = rel
+    logger.info(f"Estimated {len(relative_poses)} directed relative poses")
+    return relative_poses
 
-    k_values = list(map(float, lines[0].strip().split()))
-    K = np.array(k_values).reshape(3, 3)
-    baseline = float(lines[1].strip())
 
-    return K, baseline
+def _build_ba_edges(
+    relative_poses: RelativePoseMap,
+    init_poses: GlobalPoses,
+    min_inliers: int,
+    consistency_check: bool = True,
+    consistency_translation_min: float = 0.5,
+) -> List[PoseGraphEdge]:
+    """Construct deduplicated, filtered pose-graph edges for BA.
 
+    Steps:
 
-def load_depth_map(depth_path: Path) -> np.ndarray:
-    """Load depth map from .npy file (in meters)."""
-    return np.load(depth_path)
-
-
-def get_3d_from_depth(keypoints: np.ndarray, depth_map: np.ndarray,
-                      K: np.ndarray) -> tuple:
-    """Back-project 2D keypoints to 3D using depth map.
-
-    Args:
-        keypoints: Nx2 array of (u, v) pixel coordinates in original image size
-        depth_map: HxW depth map in meters
-        K: 3x3 camera intrinsic matrix
-
-    Returns:
-        points_3d: Nx3 array of 3D points in camera frame
-        valid_mask: N boolean array indicating valid depth
+    1. Collapse the directed relative-pose map to one entry per **undirected**
+       pair, keeping the direction with more inliers.
+    2. Drop edges below ``min_inliers``.
+    3. (Optional) Drop edges whose translation magnitude disagrees with the
+       initial poses by more than 50% (or 0.5m, whichever is larger). This
+       filter — present only on the incremental path in the prior code — is
+       generalized here because mismatched edges hurt BA regardless of init.
     """
-    fx, fy = K[0, 0], K[1, 1]
-    cx, cy = K[0, 2], K[1, 2]
+    # Step 1: dedupe by canonical (src, dst) pair.
+    best_by_canonical: Dict[tuple, RelativePose] = {}
+    for (src, dst), rel in relative_poses.items():
+        if src not in init_poses or dst not in init_poses:
+            continue
+        key = tuple(sorted((src, dst)))
+        cur = best_by_canonical.get(key)
+        if cur is None or rel.num_inliers > cur.num_inliers:
+            best_by_canonical[key] = rel
 
-    N = len(keypoints)
-    points_3d = np.zeros((N, 3), dtype=np.float32)
-    valid_mask = np.zeros(N, dtype=bool)
+    edges: List[PoseGraphEdge] = []
+    n_inlier_filtered = 0
+    n_consistency_filtered = 0
+    for rel in best_by_canonical.values():
+        if rel.num_inliers < min_inliers:
+            n_inlier_filtered += 1
+            continue
 
-    H, W = depth_map.shape
+        if consistency_check:
+            T_src = init_poses[rel.src]
+            T_dst = init_poses[rel.dst]
+            # Expected T_rel from poses: T_world_dst = T_world_src @ inv(T_rel)
+            # => inv(T_rel) = inv(T_src) @ T_dst => T_rel = inv(inv(T_src) @ T_dst)
+            T_rel_expected = np.linalg.inv(np.linalg.inv(T_src) @ T_dst)
+            t_measured = float(np.linalg.norm(rel.T_rel[:3, 3]))
+            t_expected = float(np.linalg.norm(T_rel_expected[:3, 3]))
+            thresh = max(0.5 * max(t_measured, t_expected), consistency_translation_min)
+            if abs(t_measured - t_expected) > thresh:
+                n_consistency_filtered += 1
+                logger.debug(
+                    f"Drop BA edge {rel.src} -> {rel.dst}: "
+                    f"|t| measured={t_measured:.3f}m, expected={t_expected:.3f}m"
+                )
+                continue
 
-    for i, (u, v) in enumerate(keypoints):
-        # Round to nearest pixel
-        u_int, v_int = int(round(u)), int(round(v))
+        edges.append(
+            PoseGraphEdge(
+                src=rel.src, dst=rel.dst, T_rel=rel.T_rel, weight=float(rel.num_inliers)
+            )
+        )
 
-        # Bounds check
-        if 0 <= u_int < W and 0 <= v_int < H:
-            z = depth_map[v_int, u_int]
-
-            # Valid depth check (positive and reasonable range)
-            if 0.1 < z < 50.0:  # 0.1m to 50m
-                x = (u - cx) * z / fx
-                y = (v - cy) * z / fy
-                points_3d[i] = [x, y, z]
-                valid_mask[i] = True
-
-    return points_3d, valid_mask
-
-
-def estimate_pose_pnp(pts_3d: np.ndarray, pts_2d: np.ndarray,
-                      K: np.ndarray, dist_coeffs: np.ndarray = None) -> tuple:
-    """Estimate camera pose using PnP + RANSAC.
-
-    Args:
-        pts_3d: Nx3 3D points in previous frame's camera coordinate
-        pts_2d: Nx2 2D points in current frame
-        K: 3x3 camera intrinsic matrix
-        dist_coeffs: Distortion coefficients (optional)
-
-    Returns:
-        R: 3x3 rotation matrix
-        t: 3x1 translation vector
-        inliers: Inlier indices
-        success: Whether pose estimation succeeded
-    """
-    if dist_coeffs is None:
-        dist_coeffs = np.zeros(4)
-
-    if len(pts_3d) < 6:
-        return None, None, None, False
-
-    # Ensure correct data types for OpenCV
-    pts_3d = np.ascontiguousarray(pts_3d, dtype=np.float64)
-    pts_2d = np.ascontiguousarray(pts_2d, dtype=np.float64)
-    K = np.ascontiguousarray(K, dtype=np.float64)
-    dist_coeffs = np.ascontiguousarray(dist_coeffs, dtype=np.float64)
-
-    # Use P3P with RANSAC
-    # For high-resolution images (4032x3036), use larger reprojection threshold
-    success, rvec, tvec, inliers = cv2.solvePnPRansac(
-        pts_3d, pts_2d, K, dist_coeffs,
-        iterationsCount=2000,
-        reprojectionError=8.0,  # Increased for high-res images
-        confidence=0.99,
-        flags=cv2.SOLVEPNP_P3P
+    logger.info(
+        f"BA edges: {len(edges)} kept from {len(best_by_canonical)} unique pairs "
+        f"({n_inlier_filtered} below inlier threshold, "
+        f"{n_consistency_filtered} failed consistency)"
     )
-
-    if not success or inliers is None or len(inliers) < 6:
-        return None, None, None, False
-
-    # Convert to rotation matrix
-    R, _ = cv2.Rodrigues(rvec)
-    t = tvec.flatten()
-
-    # Validate pose (check for unreasonable motion)
-    translation_magnitude = np.linalg.norm(t)
-    if translation_magnitude > 10.0:  # Max 10m per frame (relaxed)
-        logger.warning(f"Large translation detected: {translation_magnitude:.2f}m")
-        return None, None, None, False
-
-    inlier_ratio = len(inliers) / len(pts_3d)
-    if inlier_ratio < 0.15:  # Lowered threshold
-        logger.warning(f"Low inlier ratio: {inlier_ratio:.2f}")
-        return None, None, None, False
-
-    return R, t, inliers.flatten(), True
+    return edges
 
 
-def pose_to_gtsam(T: np.ndarray) -> "gtsam.Pose3":
-    """Convert 4x4 transformation matrix to GTSAM Pose3."""
-    R = T[:3, :3]
-    t = T[:3, 3]
-    return gtsam.Pose3(gtsam.Rot3(R), gtsam.Point3(t))
-
-
-def gtsam_to_pose(pose3: "gtsam.Pose3") -> np.ndarray:
-    """Convert GTSAM Pose3 to 4x4 transformation matrix."""
-    T = np.eye(4)
-    T[:3, :3] = pose3.rotation().matrix()
-    T[:3, 3] = pose3.translation()
-    return T
-
-
-def compute_relative_pose(T0: np.ndarray, T1: np.ndarray) -> np.ndarray:
-    """Compute relative pose T_01 such that T1 = T0 @ T_01."""
-    return np.linalg.inv(T0) @ T1
-
-
-def run_bundle_adjustment(
-    poses: dict,
-    observations: list,
-    K: np.ndarray,
-    fix_first_pose: bool = True
-) -> dict:
-    """Run Bundle Adjustment using GTSAM with relative pose constraints.
-
-    Uses BetweenFactorPose3 to constrain relative poses between frames.
-    This is more suitable when we have good depth measurements and want
-    to optimize the pose graph.
-
-    Args:
-        poses: Dictionary mapping image name to 4x4 pose matrix
-        observations: List of observation dicts with:
-            - 'frame0': source frame name
-            - 'frame1': target frame name
-            - 'T_rel': 4x4 measured relative pose from PnP
-            - 'num_inliers': number of inliers from PnP
-        K: 3x3 camera intrinsic matrix (unused, kept for API compatibility)
-        fix_first_pose: Whether to fix the first pose
-
-    Returns:
-        optimized_poses: Dictionary with optimized poses
-    """
-    if not GTSAM_AVAILABLE:
-        logger.warning("GTSAM not available, skipping BA")
-        return poses
-
-    logger.info("Running Pose Graph Optimization with GTSAM...")
-
-    # Create factor graph
-    graph = gtsam.NonlinearFactorGraph()
-
-    # Create initial estimates
-    initial = gtsam.Values()
-
-    # Map frame names to indices
-    frame_names = list(poses.keys())
-    frame_to_idx = {name: i for i, name in enumerate(frame_names)}
-
-    # Collect relative pose measurements from observations FIRST so we know
-    # which frames will actually appear in the factor graph. Variables that
-    # are inserted into `initial` but referenced by zero factors make GTSAM's
-    # Levenberg-Marquardt elimination throw "inconsistent arguments".
-    # Use the MEASURED relative poses from PnP (stored in observations).
-    relative_poses = {}  # (frame0, frame1) -> (T_rel, num_inliers)
-
-    for obs in observations:
-        frame0, frame1 = obs['frame0'], obs['frame1']
-        if frame0 not in poses or frame1 not in poses:
-            continue
-
-        num_inliers = obs.get('num_inliers', 0)
-        if num_inliers < 10:
-            continue
-
-        T_rel = obs.get('T_rel')
-        if T_rel is None:
-            continue
-
-        key = (frame0, frame1)
-        if key not in relative_poses or num_inliers > relative_poses[key][1]:
-            relative_poses[key] = (T_rel, num_inliers)
-
-    # Identify frames that participate in at least one factor edge.
-    constrained_frames = set()
-    for (frame0, frame1) in relative_poses.keys():
-        constrained_frames.add(frame0)
-        constrained_frames.add(frame1)
-
-    isolated_frames = [n for n in frame_names if n not in constrained_frames]
-    if isolated_frames:
-        logger.warning(
-            f"Skipping {len(isolated_frames)} unconstrained frame(s) in BA "
-            f"(no qualifying factor edges): {isolated_frames}"
-        )
-
-    # Pick a prior anchor that is actually in the factor graph; falling back
-    # to the first constrained frame if frame_names[0] was isolated.
-    anchor_name = frame_names[0]
-    if fix_first_pose and anchor_name not in constrained_frames:
-        if not constrained_frames:
-            logger.warning("No constrained frames available for BA, skipping")
-            return poses
-        anchor_name = next(n for n in frame_names if n in constrained_frames)
-        logger.warning(
-            f"First frame {frame_names[0]} is isolated; anchoring prior at {anchor_name}"
-        )
-
-    # Add initial pose estimates only for frames the graph will touch.
-    for name in frame_names:
-        if name not in constrained_frames:
-            continue
-        idx = frame_to_idx[name]
-        initial.insert(X(idx), pose_to_gtsam(poses[name]))
-
-    # Prior noise model for the anchor pose (very tight if fixed)
-    if fix_first_pose:
-        prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([0.001, 0.001, 0.001, 0.001, 0.001, 0.001])  # rad, rad, rad, m, m, m
-        )
-        anchor_idx = frame_to_idx[anchor_name]
-        graph.add(gtsam.PriorFactorPose3(X(anchor_idx), pose_to_gtsam(poses[anchor_name]), prior_noise))
-
-    # Add BetweenFactorPose3 for each relative pose constraint
-    num_factors = 0
-    for (frame0, frame1), (T_rel, num_inliers) in relative_poses.items():
-        idx0 = frame_to_idx[frame0]
-        idx1 = frame_to_idx[frame1]
-
-        # Noise model based on number of inliers (more inliers = less noise)
-        # Base noise: 0.05 rad rotation, 0.05m translation
-        noise_scale = max(0.5, 100.0 / num_inliers)  # Scale inversely with inliers
-        odom_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([0.05, 0.05, 0.05, 0.05, 0.05, 0.05]) * noise_scale
-        )
-
-        # BetweenFactor: X(idx1) = X(idx0).compose(T_ij)
-        # T_rel from PnP maps points: p_cam1 = T_rel @ p_cam0
-        # World poses: T_world_1 = T_world_0 @ inv(T_rel)
-        # So T_ij = inv(T_rel)
-        T_ij = np.linalg.inv(T_rel)
-        relative_pose3 = pose_to_gtsam(T_ij)
-        graph.add(gtsam.BetweenFactorPose3(X(idx0), X(idx1), relative_pose3, odom_noise))
-        num_factors += 1
-
-        logger.debug(f"Added factor {frame0} -> {frame1}: {num_inliers} inliers, "
-                    f"noise_scale={noise_scale:.2f}")
-
-    logger.info(f"Added {num_factors} relative pose factors")
-
-    if num_factors < 2:
-        logger.warning("Too few factors for BA, skipping")
-        return poses
-
-    # Optimize with Levenberg-Marquardt
-    try:
-        params = gtsam.LevenbergMarquardtParams()
-        params.setMaxIterations(100)
-        params.setRelativeErrorTol(1e-5)
-        params.setAbsoluteErrorTol(1e-5)
-
-        optimizer = gtsam.LevenbergMarquardtOptimizer(graph, initial, params)
-        result = optimizer.optimize()
-
-        # Extract optimized poses; isolated frames keep their pre-BA pose.
-        optimized_poses = {}
-        for name in frame_names:
-            if name in constrained_frames:
-                idx = frame_to_idx[name]
-                pose3 = result.atPose3(X(idx))
-                optimized_poses[name] = gtsam_to_pose(pose3)
-            else:
-                optimized_poses[name] = poses[name]
-
-        # Report improvement
-        initial_error = graph.error(initial)
-        final_error = graph.error(result)
-        iterations = optimizer.iterations()
-        logger.info(f"BA complete: error {initial_error:.4f} -> {final_error:.4f} "
-                   f"({iterations} iterations)")
-
-        # Report pose changes
-        total_translation_change = 0.0
-        total_rotation_change = 0.0
-        for name in frame_names:
-            T_old = poses[name]
-            T_new = optimized_poses[name]
-            trans_change = np.linalg.norm(T_new[:3, 3] - T_old[:3, 3])
-            # Rotation change via Frobenius norm
-            rot_change = np.linalg.norm(T_new[:3, :3] - T_old[:3, :3])
-            total_translation_change += trans_change
-            total_rotation_change += rot_change
-
-        logger.info(f"Total pose changes: translation={total_translation_change:.4f}m, "
-                   f"rotation={total_rotation_change:.4f}")
-
-        return optimized_poses
-
-    except Exception as e:
-        logger.error(f"BA failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return poses
-
-
-def incremental_pose_initialization(
-    image_list: list,
-    process_pair_func,
-    min_inliers: int = 15,
-    logger=None,
-) -> tuple:
-    """
-    Incremental pose initialization that doesn't depend on image order.
-
-    Algorithm:
-    1. First frame is set to identity (origin)
-    2. Maintain a "registered" set of frames with known poses
-    3. Loop:
-       a. For each unregistered frame, find the best match with registered frames
-       b. Use PnP to compute the new frame's pose relative to the best match
-       c. Add the new frame to the registered set
-    4. Continue until all frames are registered or no more can be added
-    5. Collect all valid pair observations for BA
-
-    Args:
-        image_list: List of image names
-        process_pair_func: Function that processes a pair and returns
-            (pts_3d, pts_2d, inliers, R, t, success, reason, num_matches)
-        min_inliers: Minimum inlier count threshold for valid registration
-        logger: Logger instance (optional)
-
-    Returns:
-        poses: Dict[str, np.ndarray] - Image name to 4x4 pose matrix
-        pnp_results: Dict[tuple, dict] - PnP results for all successful pairs
-        unregistered: List[str] - Images that couldn't be registered
-    """
-    if logger is None:
-        import logging
-
-        logger = logging.getLogger(__name__)
-
-    n_images = len(image_list)
-    if n_images == 0:
-        return {}, {}, []
-
-    # Pass 1: Pre-compute PnP results for all pairs
-    logger.info("Pass 1: Pre-computing PnP results for all pairs...")
-    pnp_results = {}  # (img0, img1) -> {R, t, inliers, num_inliers, T_rel}
-
-    all_pairs = [
-        (image_list[i], image_list[j])
-        for i in range(n_images)
-        for j in range(i + 1, n_images)
+def _pose_results_from_relpose_map(rels: RelativePoseMap) -> List[dict]:
+    """Convert the directed relative-pose map to the legacy ``pose_results.json``
+    record format (one entry per directed pair)."""
+    return [
+        {
+            "frame0": rel.src,
+            "frame1": rel.dst,
+            "success": True,
+            "num_matches": rel.num_matches,
+            "num_inliers": rel.num_inliers,
+            "translation": float(np.linalg.norm(rel.T_rel[:3, 3])),
+        }
+        for rel in rels.values()
     ]
 
-    for img0, img1 in tqdm(all_pairs, desc="Pre-computing PnP"):
-        # Try both directions to get the best result
-        for src, dst in [(img0, img1), (img1, img0)]:
-            pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = (
-                process_pair_func(src, dst)
-            )
 
-            if success and inliers is not None and len(inliers) >= min_inliers:
-                T_rel = np.eye(4)
-                T_rel[:3, :3] = R
-                T_rel[:3, 3] = t
+def run_pipeline(
+    data_dir: Path,
+    output_dir: Path,
+    visualize: bool = False,
+    concatenate_pcd: bool = True,
+    voxel_size: float = 0.01,
+    run_ba: bool = False,
+    exhaustive_pairs: bool = True,
+    max_exhaustive_frames: int = 50,
+    incremental_init: bool = True,
+    min_init_inliers: int = 15,
+    min_ba_inliers: int = 30,
+    extrinsics_json: Optional[Path] = None,
+) -> dict:
+    """Run the stereo depth pipeline end-to-end.
 
-                key = (src, dst)
-                pnp_results[key] = {
-                    "R": R,
-                    "t": t,
-                    "inliers": inliers,
-                    "num_inliers": len(inliers),
-                    "T_rel": T_rel,
-                    "num_matches": num_matches,
-                }
-
-    logger.info(f"Pre-computed {len(pnp_results)} valid PnP results")
-
-    # Pass 2: Greedy incremental registration
-    logger.info("Pass 2: Incremental pose registration...")
-
-    # Seeding on image_list[0] is brittle: when that frame happens to be a
-    # visual outlier with no qualifying PnP edges, the greedy loop stalls
-    # on iteration 1 and every other frame is dropped. Pick the seed by
-    # total inlier connectivity instead.
-    connectivity = defaultdict(int)
-    for (a, b), res in pnp_results.items():
-        connectivity[a] += res["num_inliers"]
-        connectivity[b] += res["num_inliers"]
-
-    seed = max(
-        image_list,
-        key=lambda n: (connectivity.get(n, 0), -image_list.index(n)),
-    )
-    if connectivity.get(seed, 0) == 0:
-        logger.warning("No PnP edges available; cannot register any frame")
-        return {}, pnp_results, list(image_list)
-
-    logger.info(
-        f"Seeded registration from {seed} "
-        f"(total inlier connectivity: {connectivity[seed]})"
-    )
-
-    poses = {seed: np.eye(4)}
-    registered = {seed}
-    unregistered = set(image_list) - {seed}
-    registration_order = [seed]
-
-    while unregistered:
-        # Find the best candidate: unregistered frame with most inliers to any registered frame
-        best_candidate = None
-        best_reference = None
-        best_inliers = 0
-        best_key = None
-
-        for candidate in unregistered:
-            for ref in registered:
-                # Check both directions
-                for key in [(ref, candidate), (candidate, ref)]:
-                    if key in pnp_results:
-                        result = pnp_results[key]
-                        if result["num_inliers"] > best_inliers:
-                            best_inliers = result["num_inliers"]
-                            best_candidate = candidate
-                            best_reference = ref
-                            best_key = key
-
-        if best_candidate is None:
-            # No more frames can be registered (disconnected from main component).
-            logger.warning(
-                f"Cannot register {len(unregistered)} frames "
-                f"(disconnected from main component): "
-                f"{list(unregistered)[:5]}{'...' if len(unregistered) > 5 else ''}"
-            )
-            break
-
-        # Compute pose for the new frame
-        result = pnp_results[best_key]
-        T_ref = poses[best_reference]
-
-        if best_key[0] == best_reference:
-            # Reference -> Candidate: T_cand = T_ref @ inv(T_rel)
-            T_candidate = T_ref @ np.linalg.inv(result["T_rel"])
-        else:
-            # Candidate -> Reference: T_cand = T_ref @ T_rel
-            T_candidate = T_ref @ result["T_rel"]
-
-        poses[best_candidate] = T_candidate
-        registered.add(best_candidate)
-        unregistered.remove(best_candidate)
-        registration_order.append(best_candidate)
-
-        logger.debug(
-            f"Registered {best_candidate} via {best_reference} "
-            f"({best_inliers} inliers)"
-        )
-
-    logger.info(
-        f"Registered {len(registered)}/{n_images} frames "
-        f"({len(unregistered)} unregistered)"
-    )
-
-    return poses, pnp_results, list(unregistered)
-
-
-def load_poses_from_json(json_path: Path) -> dict:
-    """Load camera poses from a JSON file.
-
-    Args:
-        json_path: Path to JSON file with format:
-            {
-                "<timestamp>.jpg": [[r11, r12, r13, t1], [r21, r22, r23, t2], [r31, r32, r33, t3]],
-                ...
-            }
-            Each value is a 3x4 [R|t] matrix.
-
-    Returns:
-        poses: Dict[str, np.ndarray] - Image name to 4x4 pose matrix
+    Signature preserved verbatim for backward compatibility with ``run_test.py``
+    and the CLI shim. See module docstring for the per-stage modules invoked.
     """
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-
-    poses = {}
-    for img_name, matrix_3x4 in data.items():
-        # Convert 3x4 [R|t] to 4x4 homogeneous matrix
-        T = np.eye(4)
-        T[:3, :] = np.array(matrix_3x4)
-        poses[img_name] = T
-
-    logger.info(f"Loaded {len(poses)} poses from {json_path}")
-    return poses
-
-
-def run_pipeline(data_dir: Path, output_dir: Path,
-                 visualize: bool = False,
-                 concatenate_pcd: bool = True,
-                 voxel_size: float = 0.01,
-                 run_ba: bool = False,
-                 exhaustive_pairs: bool = True,
-                 max_exhaustive_frames: int = 50,
-                 incremental_init: bool = True,
-                 min_init_inliers: int = 15,
-                 min_ba_inliers: int = 30,
-                 extrinsics_json: Path = None) -> dict:
-    """Run the stereo depth pipeline.
-
-    Args:
-        data_dir: Directory containing timestamp folders
-        output_dir: Output directory for results
-        visualize: Whether to show visualizations
-        concatenate_pcd: Whether to concatenate point clouds
-        voxel_size: Voxel size for point cloud downsampling
-        run_ba: Whether to run Bundle Adjustment
-        exhaustive_pairs: Use exhaustive pairing for better BA constraints
-        max_exhaustive_frames: Max frames for exhaustive pairing (falls back to sequential)
-        incremental_init: Use incremental best-match initialization (order-independent)
-        min_init_inliers: Minimum inlier count for valid registration in incremental init
-        min_ba_inliers: Minimum inlier count for BA edges (higher = more conservative)
-        extrinsics_json: Path to JSON file with pre-computed camera poses (skips pose estimation)
-
-    Returns:
-        results: Dictionary with poses and statistics
-    """
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find all timestamp folders
-    timestamp_dirs = sorted([
-        d for d in data_dir.iterdir()
-        if d.is_dir() and d.name.isdigit()
-    ])
+    # Stage 1: dataset scan.
+    frames = scan_frames(Path(data_dir))
+    if len(frames) < 2:
+        raise ValueError(f"Need at least 2 frames, found {len(frames)}")
+    frame_info = {f.name: f for f in frames}
+    frame_names = [f.name for f in frames]
 
-    if len(timestamp_dirs) < 2:
-        raise ValueError(f"Need at least 2 frames, found {len(timestamp_dirs)}")
+    # Stage 2: pair list.
+    mode = "exhaustive" if exhaustive_pairs else "sequential"
+    pairs = generate_pairs(frames, mode=mode, max_exhaustive=max_exhaustive_frames)
+    use_exhaustive = exhaustive_pairs and len(frames) <= max_exhaustive_frames
 
-    logger.info(f"Found {len(timestamp_dirs)} frames")
+    # Stage 3: feature extraction + matching.
+    features_h5, matches_h5 = run_matching(frames, pairs, output_dir)
 
-    # Step 1: Prepare images for hloc
-    images_dir = output_dir / "images"
-    images_dir.mkdir(exist_ok=True)
-
-    frame_info = {}  # Map image name -> original data
-    image_list = []
-
-    for ts_dir in timestamp_dirs:
-        left_img = ts_dir / "rect_left.jpg"
-        if not left_img.exists():
-            logger.warning(f"Missing rect_left.jpg in {ts_dir}")
-            continue
-
-        # Create symlink or copy to images dir
-        img_name = f"{ts_dir.name}.jpg"
-        dst_path = images_dir / img_name
-
-        if not dst_path.exists():
-            import shutil
-            shutil.copy(left_img, dst_path)
-
-        # Load camera intrinsics
-        k_txt = ts_dir / "K.txt"
-        K, baseline = load_camera_intrinsics(k_txt)
-
-        frame_info[img_name] = {
-            "timestamp_dir": ts_dir,
-            "K": K,
-            "baseline": baseline,
-            "depth_path": ts_dir / "depth_meter.npy",
-            "cloud_path": ts_dir / "cloud.ply",
-        }
-        image_list.append(img_name)
-
-    logger.info(f"Prepared {len(image_list)} images for feature extraction")
-
-    # Step 2: Extract features using hloc
-    features_path = output_dir / "features.h5"
-
-    logger.info("Extracting features with SuperPoint...")
-    extract_features.main(
-        conf=EXTRACT_CONF,
-        image_dir=images_dir,
-        export_dir=output_dir,
-        feature_path=features_path,
+    # Stage 4: per-pair relative pose estimation. We always try both directions
+    # because depth-based PnP is asymmetric (the src side needs valid depth).
+    estimator = DepthPnPEstimator()
+    relative_poses = _estimate_all_relative_poses(
+        pairs, frame_info, features_h5, matches_h5, estimator, try_both_directions=True
     )
 
-    # Step 3: Create pairs
-    pairs_path = output_dir / "pairs.txt"
-    use_exhaustive = exhaustive_pairs and len(image_list) <= max_exhaustive_frames
-
-    if use_exhaustive:
-        # Exhaustive pairing: all combinations for dense BA constraints
-        num_pairs = 0
-        with open(pairs_path, 'w') as f:
-            for i in range(len(image_list)):
-                for j in range(i + 1, len(image_list)):
-                    f.write(f"{image_list[i]} {image_list[j]}\n")
-                    num_pairs += 1
-        logger.info(f"Created {num_pairs} exhaustive pairs (all combinations)")
-    else:
-        # Sequential pairing: fallback for large datasets
-        with open(pairs_path, 'w') as f:
-            for i in range(len(image_list) - 1):
-                f.write(f"{image_list[i]} {image_list[i+1]}\n")
-        logger.info(f"Created {len(image_list) - 1} sequential pairs")
-
-    # Step 4: Match features using hloc
-    matches_path = output_dir / "matches.h5"
-
-    logger.info("Matching features with LightGlue...")
-    match_features.main(
-        conf=MATCH_CONF,
-        pairs=pairs_path,
-        features=features_path,
-        export_dir=output_dir,
-        matches=matches_path,
-    )
-
-    # Step 5: Pose estimation with depth-based PnP
-    logger.info("Estimating poses with depth-based PnP...")
-
-    # Note: hloc automatically scales keypoint coordinates back to original image size
-    # (see extract_features.py line 274), so no manual scaling is needed
-
-    pose_results = []
-    ba_observations = []  # Collect observations for BA
-
-    # Store K matrix for BA
-    sample_K = frame_info[image_list[0]]["K"]
-
-    # Helper function to process a pair and get observations
-    def process_pair(img0, img1):
-        """Process a pair and return (pts_3d, pts_2d, inliers, R, t, success, reason)."""
-        kpts0 = get_keypoints(features_path, img0)
-        kpts1 = get_keypoints(features_path, img1)
-
-        try:
-            matches, scores = get_matches(matches_path, img0, img1)
-        except ValueError:
-            return None, None, None, None, None, False, "no_matches", 0
-
-        num_matches = len(matches)
-        if num_matches < 10:
-            return None, None, None, None, None, False, "too_few_matches", num_matches
-
-        matched_kpts0 = kpts0[matches[:, 0]]
-        matched_kpts1 = kpts1[matches[:, 1]]
-
-        info0 = frame_info[img0]
-        depth0 = load_depth_map(info0["depth_path"])
-        K = info0["K"]
-
-        pts_3d, depth_valid = get_3d_from_depth(matched_kpts0, depth0, K)
-
-        if depth_valid.sum() < 10:
-            return None, None, None, None, None, False, "too_few_depth", num_matches
-
-        pts_3d_valid = pts_3d[depth_valid]
-        pts_2d_valid = matched_kpts1[depth_valid]
-
-        R, t, inliers, success = estimate_pose_pnp(pts_3d_valid, pts_2d_valid, K)
-
-        if not success:
-            return pts_3d_valid, pts_2d_valid, None, None, None, False, "pnp_failed", num_matches
-
-        return pts_3d_valid, pts_2d_valid, inliers, R, t, True, None, num_matches
-
-    # Step 5a: Pose initialization
+    # Stage 5: global pose initialization. The choice of initializer is the
+    # main per-image-init swap-point the user asked about; new initializers
+    # only need to implement the ``GlobalPoseInitializer`` protocol.
     if extrinsics_json is not None:
-        # Use pre-computed poses from JSON file (as initial state for optional BA)
-        logger.info(f"Loading poses from {extrinsics_json}...")
-        all_poses = load_poses_from_json(extrinsics_json)
-
-        # Filter to only include images in our image_list
-        poses = {}
-        missing_poses = []
-        for img_name in image_list:
-            if img_name in all_poses:
-                poses[img_name] = all_poses[img_name]
-            else:
-                missing_poses.append(img_name)
-                logger.warning(f"No pose found for {img_name} in extrinsics JSON")
-
-        if missing_poses:
-            logger.warning(f"Missing poses for {len(missing_poses)} images")
-
-        logger.info(f"Loaded poses for {len(poses)}/{len(image_list)} images")
-
-        # If BA requested, collect observations from PnP to refine the poses
-        if run_ba:
-            logger.info("Collecting BA observations from all pairs...")
-            all_pairs = [
-                (image_list[i], image_list[j])
-                for i in range(len(image_list))
-                for j in range(i + 1, len(image_list))
-            ]
-
-            pair_best = {}  # Deduplicate: only keep best direction per pair
-            for img0, img1 in tqdm(all_pairs, desc="Computing PnP for BA"):
-                if img0 not in poses or img1 not in poses:
-                    continue
-
-                # Try both directions
-                for src, dst in [(img0, img1), (img1, img0)]:
-                    pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = (
-                        process_pair(src, dst)
-                    )
-
-                    if success and inliers is not None:
-                        canonical_key = tuple(sorted([src, dst]))
-                        num_inliers = len(inliers)
-
-                        if canonical_key not in pair_best or num_inliers > pair_best[canonical_key]["num_inliers"]:
-                            T_rel = np.eye(4)
-                            T_rel[:3, :3] = R
-                            T_rel[:3, 3] = t
-                            pair_best[canonical_key] = {
-                                "frame0": src,
-                                "frame1": dst,
-                                "T_rel": T_rel,
-                                "num_inliers": num_inliers,
-                            }
-
-            # Filter by inlier threshold and consistency
-            effective_min_ba_inliers = max(min_init_inliers, min_ba_inliers)
-            for obs in pair_best.values():
-                if obs["num_inliers"] >= effective_min_ba_inliers:
-                    ba_observations.append(obs)
-
-            logger.info(
-                f"Collected {len(ba_observations)} BA observation pairs "
-                f"(from {len(pair_best)} unique pairs)"
-            )
-
+        initializer = JsonInitializer(Path(extrinsics_json))
     elif use_exhaustive and incremental_init:
-        # Incremental initialization (order-independent)
-        logger.info("Using incremental pose initialization (order-independent)...")
-        poses, pnp_results, unregistered = incremental_pose_initialization(
-            image_list=image_list,
-            process_pair_func=process_pair,
-            min_inliers=min_init_inliers,
-            logger=logger,
-        )
-
-        if unregistered:
-            logger.warning(
-                f"Could not register {len(unregistered)} frames: {unregistered}"
-            )
-
-        # Convert pnp_results to pose_results format for logging
-        for (img0, img1), result in pnp_results.items():
-            pose_results.append({
-                "frame0": img0,
-                "frame1": img1,
-                "success": True,
-                "num_matches": result.get("num_matches", 0),
-                "num_inliers": result["num_inliers"],
-                "translation": np.linalg.norm(result["t"]),
-            })
-
-        # Collect BA observations from all successful PnP results
-        # Only keep one direction per pair (the one with more inliers)
-        # to avoid conflicting constraints
-        pair_best = {}  # (min_img, max_img) -> best observation
-        for (img0, img1), result in pnp_results.items():
-            if img0 not in poses or img1 not in poses:
-                continue
-
-            # Canonical key (sorted) to detect duplicates
-            canonical_key = tuple(sorted([img0, img1]))
-            num_inliers = result["num_inliers"]
-
-            if canonical_key not in pair_best or num_inliers > pair_best[canonical_key]["num_inliers"]:
-                pair_best[canonical_key] = {
-                    "frame0": img0,
-                    "frame1": img1,
-                    "T_rel": result["T_rel"],
-                    "num_inliers": num_inliers,
-                }
-
-        # Filter by higher threshold for BA (more conservative)
-        # Also check consistency with initialized poses
-        effective_min_ba_inliers = max(min_init_inliers, min_ba_inliers)
-        num_inlier_filtered = 0
-        num_consistency_filtered = 0
-
-        for obs in pair_best.values():
-            if obs["num_inliers"] < effective_min_ba_inliers:
-                num_inlier_filtered += 1
-                logger.debug(
-                    f"Skipping BA edge {obs['frame0']} -> {obs['frame1']}: "
-                    f"only {obs['num_inliers']} inliers (need {effective_min_ba_inliers})"
-                )
-                continue
-
-            # Consistency check: compare measured T_rel with expected from poses
-            frame0, frame1 = obs["frame0"], obs["frame1"]
-            T0, T1 = poses[frame0], poses[frame1]
-            T_rel_measured = obs["T_rel"]
-
-            # Expected: T1 = T0 @ inv(T_rel), so T_rel_expected = inv(inv(T0) @ T1)
-            T_rel_expected = np.linalg.inv(np.linalg.inv(T0) @ T1)
-
-            # Compare translation magnitude
-            t_measured = np.linalg.norm(T_rel_measured[:3, 3])
-            t_expected = np.linalg.norm(T_rel_expected[:3, 3])
-
-            # Allow 50% translation difference or 0.5m absolute, whichever is larger
-            t_threshold = max(0.5 * max(t_measured, t_expected), 0.5)
-            t_diff = abs(t_measured - t_expected)
-
-            if t_diff > t_threshold:
-                num_consistency_filtered += 1
-                logger.debug(
-                    f"Skipping BA edge {frame0} -> {frame1}: "
-                    f"translation inconsistent (measured={t_measured:.3f}m, "
-                    f"expected={t_expected:.3f}m, diff={t_diff:.3f}m)"
-                )
-                continue
-
-            ba_observations.append(obs)
-
-        logger.info(
-            f"Collected {len(ba_observations)} BA observation pairs "
-            f"(from {len(pair_best)} unique pairs: "
-            f"{num_inlier_filtered} filtered by inliers, "
-            f"{num_consistency_filtered} filtered by consistency)"
-        )
-
+        initializer = IncrementalInitializer(min_inliers=min_init_inliers)
     else:
-        # Sequential initialization (original behavior, backward compatible)
-        logger.info("Using sequential pose initialization...")
-        poses = {image_list[0]: np.eye(4)}
-        T_world = np.eye(4)  # Cumulative pose
+        initializer = SequentialInitializer()
 
-        for i in tqdm(range(len(image_list) - 1), desc="Sequential PnP"):
-            img0, img1 = image_list[i], image_list[i + 1]
+    poses, unregistered = initializer.initialize(frame_names, relative_poses)
+    if unregistered:
+        logger.warning(f"Unregistered frames: {unregistered}")
 
-            pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = process_pair(
-                img0, img1
-            )
+    pose_results = _pose_results_from_relpose_map(relative_poses)
 
-            if not success:
-                logger.warning(f"Sequential PnP failed for {img0} -> {img1}: {reason}")
-                poses[img1] = T_world.copy()
-                pose_results.append({
-                    "frame0": img0,
-                    "frame1": img1,
-                    "success": False,
-                    "reason": reason,
-                })
-                continue
+    # Stage 6: optional pose-graph BA. The optimizer is generic over edges,
+    # so any source of pairwise transforms (PnP today, IMU/odometry/etc.
+    # tomorrow) can feed it.
+    if run_ba and GTSAM_AVAILABLE and relative_poses:
+        edges = _build_ba_edges(
+            relative_poses,
+            poses,
+            min_inliers=max(min_init_inliers, min_ba_inliers),
+        )
+        if edges:
+            optimizer = GtsamPoseGraphOptimizer()
+            poses = optimizer.optimize(poses, edges)
+        else:
+            logger.warning("No BA edges survived filtering; skipping optimization")
+    elif run_ba and not GTSAM_AVAILABLE:
+        logger.warning("--ba requested but GTSAM unavailable; skipping")
 
-            # Relative pose (from frame0 to frame1)
-            T_rel = np.eye(4)
-            T_rel[:3, :3] = R
-            T_rel[:3, 3] = t
+    # Stage 7: pose I/O.
+    save_poses_txt(poses, output_dir / "poses.txt")
+    save_pose_results(pose_results, output_dir / "pose_results.json")
 
-            # Accumulate pose: T_world_new = T_world @ inv(T_rel)
-            T_world = T_world @ np.linalg.inv(T_rel)
-            poses[img1] = T_world.copy()
-
-            pose_results.append({
-                "frame0": img0,
-                "frame1": img1,
-                "success": True,
-                "num_matches": num_matches,
-                "num_depth_valid": len(pts_3d),
-                "num_inliers": len(inliers),
-                "translation": np.linalg.norm(t),
-            })
-
-            logger.debug(
-                f"{img0} -> {img1}: matches={num_matches}, "
-                f"depth_valid={len(pts_3d)}, inliers={len(inliers)}, "
-                f"t={np.linalg.norm(t):.3f}m"
-            )
-
-        # Step 5b: Collect BA observations for sequential mode
-        if run_ba:
-            if use_exhaustive:
-                # Collect from all pairs even if using sequential init
-                logger.info("Collecting BA observations from all pairs...")
-                all_pairs = [
-                    (image_list[i], image_list[j])
-                    for i in range(len(image_list))
-                    for j in range(i + 1, len(image_list))
-                ]
-
-                for img0, img1 in tqdm(all_pairs, desc="BA observations"):
-                    if img0 not in poses or img1 not in poses:
-                        continue
-
-                    pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = (
-                        process_pair(img0, img1)
-                    )
-
-                    if success and inliers is not None:
-                        T_rel_measured = np.eye(4)
-                        T_rel_measured[:3, :3] = R
-                        T_rel_measured[:3, 3] = t
-                        ba_observations.append({
-                            "frame0": img0,
-                            "frame1": img1,
-                            "T_rel": T_rel_measured,
-                            "num_inliers": len(inliers),
-                        })
-                logger.info(f"Collected {len(ba_observations)} BA observation pairs")
-            else:
-                # Use sequential observations only
-                for i in range(len(image_list) - 1):
-                    img0, img1 = image_list[i], image_list[i + 1]
-                    if img0 not in poses or img1 not in poses:
-                        continue
-
-                    pts_3d, pts_2d, inliers, R, t, success, reason, num_matches = (
-                        process_pair(img0, img1)
-                    )
-
-                    if success and inliers is not None:
-                        T_rel_measured = np.eye(4)
-                        T_rel_measured[:3, :3] = R
-                        T_rel_measured[:3, 3] = t
-                        ba_observations.append({
-                            "frame0": img0,
-                            "frame1": img1,
-                            "T_rel": T_rel_measured,
-                            "num_inliers": len(inliers),
-                        })
-
-    # Step 5.5: Bundle Adjustment (optional)
-    if run_ba and GTSAM_AVAILABLE and len(ba_observations) > 0:
-        poses = run_bundle_adjustment(poses, ba_observations, sample_K)
-
-    # Save poses
-    poses_file = output_dir / "poses.txt"
-    with open(poses_file, 'w') as f:
-        for img_name, T in poses.items():
-            f.write(f"# {img_name}\n")
-            for row in T:
-                f.write(" ".join(f"{v:.8f}" for v in row) + "\n")
-
-    logger.info(f"Saved poses to {poses_file}")
-
-    # Save pose results
-    results_file = output_dir / "pose_results.json"
-    with open(results_file, 'w') as f:
-        json.dump(pose_results, f, indent=2)
-
-    # Step 6: Concatenate point clouds (optional)
+    # Stage 8: optional point-cloud fusion.
     if concatenate_pcd:
-        logger.info("Concatenating point clouds...")
-        concatenate_point_clouds(frame_info, poses, output_dir / "combined.ply", voxel_size)
+        merge_point_clouds(frames, poses, output_dir / "combined.ply", voxel_size)
 
     return {
-        "num_frames": len(image_list),
+        "num_frames": len(frames),
         "num_successful": sum(1 for r in pose_results if r.get("success", False)),
         "poses": poses,
         "pose_results": pose_results,
     }
-
-
-def concatenate_point_clouds(frame_info: dict, poses: dict, output_path: Path,
-                             voxel_size: float = 0.01):
-    """Concatenate point clouds using estimated poses.
-
-    Args:
-        frame_info: Dictionary mapping image name to frame info
-        poses: Dictionary mapping image name to 4x4 pose matrix
-        output_path: Output PLY file path
-        voxel_size: Voxel size for downsampling (0 to disable)
-    """
-    try:
-        import open3d as o3d
-    except ImportError:
-        logger.error("open3d not installed, skipping point cloud concatenation")
-        return
-
-    combined_pcd = o3d.geometry.PointCloud()
-
-    for img_name, info in tqdm(frame_info.items(), desc="Concatenating PCDs"):
-        cloud_path = info["cloud_path"]
-        if not cloud_path.exists():
-            logger.warning(f"Missing point cloud: {cloud_path}")
-            continue
-
-        if img_name not in poses:
-            logger.warning(f"No pose for {img_name}")
-            continue
-
-        # Load point cloud using Open3D
-        pcd = o3d.io.read_point_cloud(str(cloud_path))
-
-        # Transform to world frame
-        T = poses[img_name]
-        pcd.transform(T)
-
-        # Accumulate points
-        combined_pcd += pcd
-
-    if len(combined_pcd.points) == 0:
-        logger.error("No point clouds to concatenate")
-        return
-
-    logger.info(f"Total points before downsampling: {len(combined_pcd.points)}")
-
-    # Voxel downsampling if requested
-    if voxel_size > 0:
-        logger.info(f"Downsampling with voxel size {voxel_size}m...")
-        combined_pcd = combined_pcd.voxel_down_sample(voxel_size)
-        logger.info(f"Points after downsampling: {len(combined_pcd.points)}")
-
-    # Save as PLY
-    o3d.io.write_point_cloud(str(output_path), combined_pcd)
-
-    logger.info(f"Saved combined point cloud to {output_path} "
-                f"({len(combined_pcd.points)} points)")
 
 
 def main():
@@ -1108,61 +263,77 @@ def main():
         description="Stereo Depth Pipeline: hloc matching + depth-based PnP"
     )
     parser.add_argument(
-        "--data_dir", type=Path, required=True,
-        help="Directory containing timestamp folders with stereo data"
+        "--data_dir",
+        type=Path,
+        required=True,
+        help="Directory containing timestamp folders with stereo data",
     )
     parser.add_argument(
-        "--output_dir", type=Path, default=None,
-        help="Output directory (default: data_dir/hloc_output)"
+        "--output_dir",
+        type=Path,
+        default=None,
+        help="Output directory (default: data_dir/hloc_output)",
     )
     parser.add_argument(
-        "--no_pcd", action="store_true",
-        help="Skip point cloud concatenation"
+        "--no_pcd", action="store_true", help="Skip point cloud concatenation"
     )
     parser.add_argument(
-        "--voxel_size", type=float, default=0.01,
-        help="Voxel size for point cloud downsampling (default: 0.01m)"
+        "--voxel_size",
+        type=float,
+        default=0.01,
+        help="Voxel size for point cloud downsampling (default: 0.01m)",
     )
     parser.add_argument(
-        "--ba", action="store_true",
-        help="Run Bundle Adjustment using GTSAM"
+        "--ba", action="store_true", help="Run Bundle Adjustment using GTSAM"
     )
     parser.add_argument(
-        "--sequential_pairs", action="store_true",
-        help="Use sequential pairing only (default: exhaustive for small datasets)"
+        "--sequential_pairs",
+        action="store_true",
+        help="Use sequential pairing only (default: exhaustive for small datasets)",
     )
     parser.add_argument(
-        "--max_exhaustive", type=int, default=50,
-        help="Max frames for exhaustive pairing (default: 50)"
+        "--max_exhaustive",
+        type=int,
+        default=50,
+        help="Max frames for exhaustive pairing (default: 50)",
     )
     parser.add_argument(
-        "--no_incremental_init", action="store_true",
-        help="Disable incremental initialization (use sequential initialization)"
+        "--no_incremental_init",
+        action="store_true",
+        help="Disable incremental initialization (use sequential initialization)",
     )
     parser.add_argument(
-        "--min_init_inliers", type=int, default=15,
-        help="Minimum inlier count for incremental initialization (default: 15)"
+        "--min_init_inliers",
+        type=int,
+        default=15,
+        help="Minimum inlier count for incremental initialization (default: 15)",
     )
     parser.add_argument(
-        "--min_ba_inliers", type=int, default=30,
-        help="Minimum inlier count for BA edges (default: 30, higher = more conservative)"
+        "--min_ba_inliers",
+        type=int,
+        default=30,
+        help=(
+            "Minimum inlier count for BA edges "
+            "(default: 30, higher = more conservative)"
+        ),
     )
     parser.add_argument(
-        "--extrinsics_json", type=Path, default=None,
+        "--extrinsics_json",
+        type=Path,
+        default=None,
         help="JSON file with pre-computed camera poses (skips pose estimation). "
-             "Format: {\"<timestamp>.jpg\": [[r11,r12,r13,t1], [r21,r22,r23,t2], [r31,r32,r33,t3]], ...}"
+        'Format: {"<timestamp>.jpg": [[r11,r12,r13,t1], [r21,r22,r23,t2], '
+        "[r31,r32,r33,t3]], ...}",
     )
     parser.add_argument(
-        "--verbose", "-v", action="store_true",
-        help="Enable verbose logging"
+        "--verbose", "-v", action="store_true", help="Enable verbose logging"
     )
 
     args = parser.parse_args()
 
-    # Setup logging
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
     if args.output_dir is None:
@@ -1182,8 +353,10 @@ def main():
         extrinsics_json=args.extrinsics_json,
     )
 
-    logger.info(f"Pipeline complete: {results['num_successful']}/{results['num_frames']-1} "
-                f"successful pose estimates")
+    logger.info(
+        f"Pipeline complete: {results['num_successful']}/"
+        f"{results['num_frames'] - 1} successful pose estimates"
+    )
 
 
 if __name__ == "__main__":
