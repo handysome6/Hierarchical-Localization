@@ -5,6 +5,7 @@ poses into a global pose set keyed by image name. Implementations differ in
 how they choose seed frames, propagate poses, and handle missing edges.
 """
 
+from .aruco import ArucoMarkerInitializer
 from .base import GlobalPoseInitializer
 from .from_json import JsonInitializer
 from .incremental import IncrementalInitializer
@@ -15,4 +16,5 @@ __all__ = [
     "IncrementalInitializer",
     "SequentialInitializer",
     "JsonInitializer",
+    "ArucoMarkerInitializer",
 ]

@@ -34,6 +34,7 @@ from .optimizers import GTSAM_AVAILABLE, GtsamPoseGraphOptimizer
 from .pair_selection import generate_pairs
 from .pose_estimators import DepthPnPEstimator
 from .pose_initializers import (
+    ArucoMarkerInitializer,
     IncrementalInitializer,
     JsonInitializer,
     SequentialInitializer,
@@ -178,6 +179,8 @@ def run_pipeline(
     min_init_inliers: int = 15,
     min_ba_inliers: int = 30,
     extrinsics_json: Optional[Path] = None,
+    aruco_init: bool = False,
+    aruco_min_shared_corners: int = 4,
 ) -> dict:
     """Run the stereo depth pipeline end-to-end.
 
@@ -214,6 +217,11 @@ def run_pipeline(
     # only need to implement the ``GlobalPoseInitializer`` protocol.
     if extrinsics_json is not None:
         initializer = JsonInitializer(Path(extrinsics_json))
+    elif aruco_init:
+        initializer = ArucoMarkerInitializer(
+            frame_info=frame_info,
+            min_shared_corners=aruco_min_shared_corners,
+        )
     elif use_exhaustive and incremental_init:
         initializer = IncrementalInitializer(min_inliers=min_init_inliers)
     else:
@@ -326,6 +334,19 @@ def main():
         "[r31,r32,r33,t3]], ...}",
     )
     parser.add_argument(
+        "--aruco_init",
+        action="store_true",
+        help="Use ArUco-marker 3D-3D Procrustes for pose initialization "
+        "(requires markers visible across overlapping frames)",
+    )
+    parser.add_argument(
+        "--aruco_min_shared_corners",
+        type=int,
+        default=4,
+        help="Minimum valid shared marker corners to register a pair via "
+        "ArUco init (default: 4 = one full marker)",
+    )
+    parser.add_argument(
         "--verbose", "-v", action="store_true", help="Enable verbose logging"
     )
 
@@ -351,6 +372,8 @@ def main():
         min_init_inliers=args.min_init_inliers,
         min_ba_inliers=args.min_ba_inliers,
         extrinsics_json=args.extrinsics_json,
+        aruco_init=args.aruco_init,
+        aruco_min_shared_corners=args.aruco_min_shared_corners,
     )
 
     logger.info(
